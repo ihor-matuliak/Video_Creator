@@ -4,12 +4,22 @@
   "private": true,
   "type": "module",
   "engines": {"node": ">=22"},
+  "workspaces": ["apps/desktop"],
   "scripts": {
+    "dev": "npm run dev --workspace apps/desktop",
+    "build": "npm run build --workspace apps/desktop",
+    "lint": "npm run lint --workspace apps/desktop",
+    "typecheck": "npm run typecheck --workspace apps/desktop",
+    "test": "npm run test --workspace apps/desktop",
     "qa:pack": "node --test tests/pack/*.test.mjs",
     "qa:syntax": "node tools/check-syntax.mjs",
     "qa:fixtures": "node --test tests/media-fixtures/*.test.mjs",
     "fixtures": "node tools/generate-fixtures.mjs",
     "qa:acceptance": "node tools/run-acceptance.mjs",
-    "qa:e2e": "playwright test --config tests/e2e/playwright.config.mjs"
+    "qa:e2e": "playwright test --config tests/e2e/playwright.config.mjs",
+    "test:e2e:smoke": "npm run build && playwright test --config apps/desktop/e2e/playwright.config.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.0"
   }
 }

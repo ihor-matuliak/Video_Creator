@@ -13,3 +13,11 @@ dist/
 build/
 .claude/settings.local.json
 *.key
+out/
+outputs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage/
+.coverage
+*.pem
