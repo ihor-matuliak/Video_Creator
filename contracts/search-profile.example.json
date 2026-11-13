@@ -1,0 +1,11 @@
+{
+  "categories": [
+    "funny",
+    "fails"
+  ],
+  "custom_instruction": "Завершені невдалі спроби зі зрозумілою реакцією",
+  "min_duration_ms": 5000,
+  "max_duration_ms": 90000,
+  "max_candidates": 20,
+  "allow_partial": false
+}

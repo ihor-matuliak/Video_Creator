@@ -1,0 +1,15 @@
+node_modules/
+.venv/
+__pycache__/
+.env
+.env.*
+!.env.example
+test-results/
+playwright-report/
+recordings/
+exports/
+cache/
+dist/
+build/
+.claude/settings.local.json
+*.key

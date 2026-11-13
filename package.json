@@ -1,0 +1,15 @@
+{
+  "name": "clipforge-handoff",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {"node": ">=22"},
+  "scripts": {
+    "qa:pack": "node --test tests/pack/*.test.mjs",
+    "qa:syntax": "node tools/check-syntax.mjs",
+    "qa:fixtures": "node --test tests/media-fixtures/*.test.mjs",
+    "fixtures": "node tools/generate-fixtures.mjs",
+    "qa:acceptance": "node tools/run-acceptance.mjs",
+    "qa:e2e": "playwright test --config tests/e2e/playwright.config.mjs"
+  }
+}

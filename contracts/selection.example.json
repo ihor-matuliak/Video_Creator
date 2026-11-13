@@ -1,0 +1,28 @@
+{
+  "candidates": [
+    {
+      "title": "Невдала спроба стрибка",
+      "categories": [
+        "fails"
+      ],
+      "start_id": "w1",
+      "end_id": "w4",
+      "evidence_ids": [
+        "w1",
+        "w2",
+        "w3",
+        "w4"
+      ],
+      "reason": "Озвучено задум і невдалий результат. Картинку потрібно переглянути.",
+      "scores": {
+        "clarity": 3,
+        "hook": 3,
+        "completeness": 3,
+        "emotion": 2,
+        "novelty": 2,
+        "relevance": 4
+      },
+      "visual_review_required": true
+    }
+  ]
+}
