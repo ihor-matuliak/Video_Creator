@@ -439,7 +439,7 @@ def main(
     }
 
     out_dir: Path = args.out_dir
-    base =out_dir / f"{model_slug(args.model)}-{stamp}"
+    base = out_dir / f"{model_slug(args.model)}-{stamp}"
     response_path = Path(f"{base}.response.json")
     summary_path = Path(f"{base}.summary.json")
     exit_code: int

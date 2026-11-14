@@ -26,8 +26,8 @@ import clipforge.server as server
 from clipforge.api.app import create_app
 
 
-def create_app_with_failing_route(config, *, port):
-    app = create_app(config, port=port)
+def create_app_with_failing_route(config, **kwargs):
+    app = create_app(config, **kwargs)
     sentinel = os.environ["BOOM_SENTINEL"]
 
     @app.get("/v1/boom")

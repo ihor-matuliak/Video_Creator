@@ -5,6 +5,8 @@
 * ``--config-stdin``: the first stdin line is the JSON configuration. After that the
   process watches stdin and exits on EOF, so a dead parent never leaves an orphan.
 * Without ``--config-stdin`` the configuration comes from the environment (tests only).
+* Before binding, the workspace database is opened and migrated and FFmpeg is looked up
+  (ADR 017): a locked workspace or a failed migration exits with code 2 and no ready line.
 """
 
 from __future__ import annotations
@@ -21,10 +23,18 @@ import threading
 from collections.abc import Sequence
 
 import uvicorn
+from sqlalchemy.exc import SQLAlchemyError
 
+from clipforge.adapters.media_tools import (
+    MediaTools,
+    MediaToolsUnavailableError,
+    resolve_media_tools,
+)
 from clipforge.api.app import create_app
 from clipforge.api.security import LOOPBACK_HOST
 from clipforge.config import Config, ConfigError, load_config
+from clipforge.services.runtime import Runtime
+from clipforge.storage import StorageError
 
 _MAX_CONFIG_LINE_BYTES = 16 * 1024
 
@@ -42,13 +52,42 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"clipforge: {exc}", file=sys.stderr)
         return 2
 
+    runtime = _start_runtime(config)
+    if runtime is None:
+        return 2
     try:
-        listener = _bind_loopback(args.port)
-    except OSError:
-        print("clipforge: не вдалося зайняти порт 127.0.0.1", file=sys.stderr)
-        return 1
+        try:
+            listener = _bind_loopback(args.port)
+        except OSError:
+            print("clipforge: не вдалося зайняти порт 127.0.0.1", file=sys.stderr)
+            return 1
 
-    return asyncio.run(_serve(config, listener, watch_stdin=args.config_stdin))
+        return asyncio.run(_serve(config, runtime, listener, watch_stdin=args.config_stdin))
+    finally:
+        runtime.close()
+
+
+def _start_runtime(config: Config) -> Runtime | None:
+    """Open the workspace and look for FFmpeg once, before anything is served (ADR 017).
+
+    ``None``: the workspace is locked by another sidecar or cannot be opened or migrated; the
+    reason is on stderr and the exit code is 2. Missing FFmpeg is not fatal: media routes answer
+    503 ``MEDIA_TOOLS_UNAVAILABLE`` while health and the rest keep working.
+    """
+    try:
+        media_tools: MediaTools | None = resolve_media_tools(config.mode, os.environ)
+    except MediaToolsUnavailableError as exc:
+        print(f"clipforge: {exc.message}; маршрути з відео повертатимуть 503", file=sys.stderr)
+        media_tools = None
+    try:
+        return Runtime.start(config.data_dir, media_tools=media_tools)
+    except StorageError as exc:
+        # Storage messages are Ukrainian and free of paths and stored values.
+        print(f"clipforge: {exc}", file=sys.stderr)
+    except (OSError, SQLAlchemyError):
+        # Their text may carry the data directory or SQL, so only a fixed message is printed.
+        print("clipforge: не вдалося відкрити робочу теку або базу даних", file=sys.stderr)
+    return None
 
 
 def _port(text: str) -> int:
@@ -100,11 +139,13 @@ def _bind_loopback(port: int) -> socket.socket:
     return listener
 
 
-async def _serve(config: Config, listener: socket.socket, *, watch_stdin: bool) -> int:
+async def _serve(
+    config: Config, runtime: Runtime, listener: socket.socket, *, watch_stdin: bool
+) -> int:
     port: int = listener.getsockname()[1]
     server = uvicorn.Server(
         uvicorn.Config(
-            create_app(config, port=port),
+            create_app(config, port=port, runtime=runtime),
             log_level="warning",
             access_log=False,  # request lines must never reach logs
             server_header=False,

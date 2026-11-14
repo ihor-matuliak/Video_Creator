@@ -17,11 +17,21 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from clipforge.services.errors import ErrorKind, ServiceError
+
 _LOGGER = logging.getLogger(__name__)
 
 _HTTP_ERRORS: dict[int, tuple[str, str]] = {
     404: ("NOT_FOUND", "Ресурс не знайдено"),
     405: ("METHOD_NOT_ALLOWED", "Метод не підтримується для цього ресурсу"),
+}
+# docs/04 section 4: 400 domain action, 404 id, 409 conflict, 422 schema/bounds, 503 dependency.
+_SERVICE_ERROR_STATUS: dict[ErrorKind, int] = {
+    ErrorKind.BAD_REQUEST: 400,
+    ErrorKind.NOT_FOUND: 404,
+    ErrorKind.CONFLICT: 409,
+    ErrorKind.INVALID: 422,
+    ErrorKind.UNAVAILABLE: 503,
 }
 
 
@@ -69,6 +79,17 @@ async def _handle_api_error(_: Request, exc: Exception) -> JSONResponse:
     error = cast(ApiError, exc)
     return error_response(
         error.status_code,
+        error.code,
+        error.message,
+        details=error.details,
+        retryable=error.retryable,
+    )
+
+
+async def _handle_service_error(_: Request, exc: Exception) -> JSONResponse:
+    error = cast(ServiceError, exc)
+    return error_response(
+        _SERVICE_ERROR_STATUS[error.kind],
         error.code,
         error.message,
         details=error.details,
@@ -141,5 +162,6 @@ class UnexpectedErrorMiddleware:
 
 def install_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(ApiError, _handle_api_error)
+    app.add_exception_handler(ServiceError, _handle_service_error)
     app.add_exception_handler(StarletteHTTPException, _handle_http_error)
     app.add_exception_handler(RequestValidationError, _handle_validation_error)

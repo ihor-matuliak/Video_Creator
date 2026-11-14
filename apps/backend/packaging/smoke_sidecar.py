@@ -6,7 +6,9 @@ Run after build_sidecar.py::
 
 Launches the exe the way Electron main will (``--port 0 --config-stdin``, test mode,
 data dir in a temp folder with a Cyrillic name), reads the ready line, checks
-/v1/health with and without the Bearer token, closes stdin and expects exit code 0.
+/v1/health with and without the Bearer token, creates and lists a project (the bundled
+migrations must have created the schema), closes stdin and expects exit code 0, then checks
+the SQLite file in the data dir: the migrated ``alembic_version`` and the project row.
 Prints PASS with the bundle size and build time, or FAIL with the reason (exit code 1).
 """
 
@@ -16,11 +18,13 @@ import json
 import os
 import queue
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import IO
 
@@ -32,8 +36,10 @@ DIST_DIR = REPO_ROOT / "build" / "sidecar"  # same layout as build_sidecar.py
 BUNDLE_DIR = DIST_DIR / NAME
 EXE = BUNDLE_DIR / f"{NAME}.exe"
 BUILD_INFO = DIST_DIR / "build-info.json"
+DB_FILENAME = "clipforge.sqlite3"  # same file name as clipforge.storage.database
 
 TOKEN = "smoke-" + "0123456789abcdef" * 2  # 38 printable ASCII characters, no secret value
+SMOKE_PROJECT = "Smoke"
 READY_LINE = re.compile(rb'^\{"event":"ready","port":([1-9][0-9]*)\}\n$')
 READY_TIMEOUT = 60.0  # a cold onedir start can be slow under antivirus
 EXIT_TIMEOUT = 30.0
@@ -86,6 +92,37 @@ def check_health(port: int) -> None:
         raise SmokeError(f"/v1/health without Bearer returned {anonymous.status_code}, not 401")
 
 
+def check_projects(port: int) -> None:
+    """Create a project and list it. The projects table exists only if the migrations ran."""
+    url = f"http://127.0.0.1:{port}/v1/projects"
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with httpx2.Client(trust_env=False, timeout=10.0) as http:
+        created = http.post(url, headers=headers, json={"name": SMOKE_PROJECT})
+        if created.status_code != 201:
+            raise SmokeError(f"POST /v1/projects returned {created.status_code}, not 201")
+        listed = http.get(url, headers=headers)
+    if listed.status_code != 200:
+        raise SmokeError(f"GET /v1/projects returned {listed.status_code}, not 200")
+    project_id = created.json().get("id")
+    listed_ids = {item.get("id") for item in listed.json().get("items", [])}
+    if not project_id or project_id not in listed_ids:
+        raise SmokeError("GET /v1/projects does not list the project created by POST")
+
+
+def check_database(data_dir: Path) -> None:
+    """Run after a clean exit: the SQLite file holds the migrated schema and the project row."""
+    db_path = data_dir / DB_FILENAME
+    if not db_path.is_file():
+        raise SmokeError(f"{DB_FILENAME} was not created in the data dir")
+    with closing(sqlite3.connect(db_path)) as connection:
+        versions = connection.execute("SELECT version_num FROM alembic_version").fetchall()
+        names = connection.execute("SELECT name FROM projects").fetchall()
+    if len(versions) != 1:
+        raise SmokeError(f"alembic_version has {len(versions)} rows, expected 1")
+    if (SMOKE_PROJECT,) not in names:
+        raise SmokeError("the project created through the API is not stored in the database")
+
+
 def run_sidecar(data_dir: Path, run_dir: Path) -> float:
     """Run the full launch sequence; returns seconds from spawn to the ready line."""
     config = {"mode": "test", "data_dir": str(data_dir), "session_token": TOKEN}
@@ -113,6 +150,7 @@ def run_sidecar(data_dir: Path, run_dir: Path) -> float:
         if matched is None:
             raise SmokeError(f"first stdout line is not the ready line: {raw!r}")
         check_health(int(matched.group(1)))
+        check_projects(int(matched.group(1)))
         if process.poll() is not None:
             raise SmokeError(f"sidecar exited early with code {process.returncode}")
 
@@ -160,6 +198,7 @@ def main() -> int:
             data_dir = Path(temp) / "дані проєкту"
             data_dir.mkdir()
             ready_seconds = run_sidecar(data_dir, Path(temp))
+            check_database(data_dir)
     except SmokeError as exc:
         print(f"FAIL: {exc}")
         return 1
