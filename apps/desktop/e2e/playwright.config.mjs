@@ -1,10 +1,10 @@
 import { defineConfig } from '@playwright/test';
 
-// Electron smoke E2E (run from the repository root: npm run test:e2e:smoke).
+// Electron E2E of the desktop app: every *.spec.mjs here (run from the repository root: npm run test:e2e:smoke).
 // The app must be built first; the root script does that.
 export default defineConfig({
   testDir: '.',
-  testMatch: 'smoke.spec.mjs',
+  testMatch: '*.spec.mjs',
   workers: 1,
   fullyParallel: false,
   timeout: 90_000,

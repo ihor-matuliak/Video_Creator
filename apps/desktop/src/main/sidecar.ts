@@ -5,16 +5,20 @@ import type {
 } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 
-import type { AppMode, AppState, AppStatus } from '../shared/bridge';
+import { apiFailure } from '../shared/bridge';
+import type { ApiResult, AppMode, AppState, AppStatus } from '../shared/bridge';
 import {
   SIDECAR_ARGS,
+  buildApiUrl,
   buildChildEnv,
   buildConfigLine,
   createSessionToken,
+  parseApiErrorBody,
   parseHealthBody,
   parseReadyLine,
   redact,
 } from './sidecar-protocol';
+import type { ApiMethod } from './sidecar-protocol';
 
 export type SpawnFn = (
   command: string,
@@ -30,6 +34,8 @@ export interface SidecarTiming {
   /** Health poll interval once ready (liveness check). */
   readonly livePollMs: number;
   readonly requestTimeoutMs: number;
+  /** Upper bound of one API call; source registration probes the file synchronously. */
+  readonly apiTimeoutMs: number;
   /** After stdin EOF the sidecar gets this long to exit before it is killed. */
   readonly stopGraceMs: number;
 }
@@ -39,6 +45,7 @@ const DEFAULT_TIMING: SidecarTiming = {
   startPollMs: 100,
   livePollMs: 5_000,
   requestTimeoutMs: 2_000,
+  apiTimeoutMs: 60_000,
   stopGraceMs: 5_000,
 };
 
@@ -47,6 +54,14 @@ const LIVENESS_FAILURE_LIMIT = 3;
 const KILL_WAIT_MS = 2_000;
 const STDOUT_LIMIT = 64 * 1024;
 const STDERR_TAIL_LIMIT = 4 * 1024;
+/** The only headers of a media answer that `fetchMedia` passes on. */
+const MEDIA_HEADERS: readonly string[] = [
+  'Content-Range',
+  'Content-Length',
+  'Accept-Ranges',
+  'Content-Type',
+];
+const MEDIA_ERROR_HEADERS: readonly string[] = ['Content-Range', 'Accept-Ranges'];
 
 export interface SidecarOptions {
   readonly mode: AppMode;
@@ -62,9 +77,10 @@ export interface SidecarOptions {
 }
 
 /**
- * Owns the Python sidecar child process (ADR 013). The session token exists
- * only here: it goes to the child through stdin, to /v1/health in an
- * Authorization header and nowhere else (not argv, not the renderer, not logs).
+ * Owns the Python sidecar child process (ADR 013). The session token and the
+ * port exist only here: the token goes to the child through stdin and to the
+ * sidecar in an Authorization header (health checks and `request`), nowhere
+ * else (not argv, not the renderer, not logs, not any returned value).
  */
 export class Sidecar {
   readonly #options: SidecarOptions;
@@ -79,6 +95,7 @@ export class Sidecar {
   #version: string | null = null;
   #child: ChildProcessWithoutNullStreams | null = null;
   #token = '';
+  #port: number | null = null;
   #exited = false;
   #stopping = false;
   #stopPromise: Promise<void> | undefined;
@@ -161,6 +178,124 @@ export class Sidecar {
     }, this.#timing.startupTimeoutMs);
   }
 
+  /**
+   * One authenticated API call. `path` must be a fixed path under /v1/ built by
+   * the caller from validated parts; the answer is reduced to an `ApiResult`
+   * and the session token is removed from it. Never throws for transport or
+   * backend failures. A failed or timed-out call is not retried here: a
+   * mutation may have been applied.
+   */
+  async request(method: ApiMethod, path: string, body?: unknown): Promise<ApiResult<unknown>> {
+    const port = this.#port;
+    if (this.#state !== 'ready' || port === null) {
+      return this.#state === 'failed'
+        ? apiFailure('BACKEND_UNAVAILABLE', 'Локальний рушій недоступний')
+        : apiFailure('BACKEND_NOT_READY', 'Локальний рушій ще запускається', true);
+    }
+    const url = buildApiUrl(port, path);
+    if (url === null) {
+      return apiFailure('INVALID_REQUEST', 'Некоректний запит до локального рушія');
+    }
+
+    const timeout = AbortSignal.timeout(this.#timing.apiTimeoutMs);
+    let status: number;
+    let ok: boolean;
+    let raw: string;
+    try {
+      const response = await this.#fetch(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${this.#token}`,
+          Accept: 'application/json',
+          ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        redirect: 'error',
+        signal: AbortSignal.any([this.#abort.signal, timeout]),
+      });
+      status = response.status;
+      ok = response.ok;
+      raw = await response.text();
+    } catch {
+      // The message of a transport error is not passed on: it may name the URL.
+      return timeout.aborted
+        ? apiFailure('REQUEST_TIMEOUT', 'Локальний рушій не відповів вчасно', method === 'GET')
+        : apiFailure('BACKEND_UNAVAILABLE', 'Локальний рушій недоступний', method === 'GET');
+    }
+
+    const parsed = parseJsonBody(redact(raw, this.#token));
+    if (parsed === undefined) {
+      return apiFailure('BAD_BACKEND_RESPONSE', 'Локальний рушій повернув неочікувану відповідь');
+    }
+    return ok
+      ? { ok: true, data: parsed.value }
+      : { ok: false, error: parseApiErrorBody(parsed.value, status) };
+  }
+
+  /**
+   * One authenticated GET of media bytes, streamed. `path` is a fixed path under
+   * /v1/ built by the caller from validated parts; `range` is the renderer's Range
+   * header, forwarded as is (the backend answers 200, 206 or 416). Never throws:
+   * transport trouble becomes a bodyless 502/503/504.
+   *
+   * Only the status and Content-Range, Content-Length, Accept-Ranges and
+   * Content-Type come back, so no other header can carry the session token out.
+   * An answer other than 200/206 keeps just the status, Content-Range and
+   * Accept-Ranges: its body (a JSON error) is dropped. The time limit covers the
+   * wait for the response headers only; a body may stream for as long as it takes,
+   * until the caller's `signal` aborts or the sidecar stops. Not retried.
+   */
+  async fetchMedia(path: string, range: string | null, signal?: AbortSignal): Promise<Response> {
+    const port = this.#port;
+    if (this.#state !== 'ready' || port === null) {
+      return new Response(null, { status: 503 });
+    }
+    const url = buildApiUrl(port, path);
+    if (url === null) {
+      return new Response(null, { status: 400 });
+    }
+
+    const headersTimeout = new AbortController();
+    const timer = setTimeout(() => {
+      headersTimeout.abort();
+    }, this.#timing.apiTimeoutMs);
+    let upstream: Response;
+    try {
+      upstream = await this.#fetch(url, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${this.#token}`,
+          ...(range === null ? {} : { Range: range }),
+        },
+        redirect: 'error',
+        signal: AbortSignal.any([
+          this.#abort.signal,
+          headersTimeout.signal,
+          ...(signal === undefined ? [] : [signal]),
+        ]),
+      });
+    } catch {
+      // The message of a transport error is not passed on: it may name the URL.
+      return new Response(null, { status: headersTimeout.signal.aborted ? 504 : 502 });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const streamed = upstream.status === 200 || upstream.status === 206;
+    const headers = new Headers();
+    for (const name of streamed ? MEDIA_HEADERS : MEDIA_ERROR_HEADERS) {
+      const value = upstream.headers.get(name);
+      if (value !== null) {
+        headers.set(name, redact(value, this.#token));
+      }
+    }
+    if (!streamed) {
+      await upstream.body?.cancel().catch(() => undefined);
+      return new Response(null, { status: upstream.status, headers });
+    }
+    return new Response(upstream.body, { status: upstream.status, headers });
+  }
+
   /** Graceful stop: stdin EOF, then kill of this child only if it does not exit. */
   stop(): Promise<void> {
     this.#stopping = true;
@@ -228,6 +363,7 @@ export class Sidecar {
       const port = parseReadyLine(line.trim());
       if (port !== null) {
         this.#readySeen = true;
+        this.#port = port;
         void this.#monitor(port);
         return;
       }
@@ -302,6 +438,19 @@ export class Sidecar {
       ),
     );
     this.#kill();
+  }
+}
+
+/** An empty body is `null`; undefined means the text is not JSON. */
+function parseJsonBody(raw: string): { readonly value: unknown } | undefined {
+  const text = raw.trim();
+  if (text === '') {
+    return { value: null };
+  }
+  try {
+    return { value: JSON.parse(text) };
+  } catch {
+    return undefined;
   }
 }
 

@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 
-import type { AppMode } from '../shared/bridge';
+import type { ApiErrorInfo, AppMode } from '../shared/bridge';
 
 /** Fixed argv of the sidecar (ADR 013). No path, token or user text goes here. */
 export const SIDECAR_ARGS: readonly string[] = [
@@ -106,6 +106,61 @@ export function parseHealthBody(body: unknown, expectedMode: AppMode): string | 
     return version;
   }
   return null;
+}
+
+export type ApiMethod = 'GET' | 'POST' | 'PATCH';
+
+const LOOPBACK = '127.0.0.1';
+const MAX_ERROR_CODE_LENGTH = 100;
+const MAX_ERROR_MESSAGE_LENGTH = 1_000;
+
+/**
+ * URL of an API path on the sidecar, or null when the path is not strictly
+ * under /v1/. The origin is always the loopback address and the sidecar port.
+ */
+export function buildApiUrl(port: number, path: string): string | null {
+  if (!path.startsWith('/v1/') || path.includes('\\')) {
+    return null;
+  }
+  const origin = `http://${LOOPBACK}:${String(port)}`;
+  try {
+    const url = new URL(path, origin);
+    return url.origin === origin && url.pathname.startsWith('/v1/') && url.hash === ''
+      ? url.href
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reduces a backend error answer (docs/04 section 4) to code, message and
+ * retryable. `details` is dropped; a body of another shape gets a generic error.
+ */
+export function parseApiErrorBody(body: unknown, status: number): ApiErrorInfo {
+  if (typeof body === 'object' && body !== null && 'error' in body) {
+    const error: unknown = body.error;
+    if (typeof error === 'object' && error !== null) {
+      const { code, message, retryable } = error as Record<string, unknown>;
+      if (
+        typeof code === 'string' &&
+        code !== '' &&
+        typeof message === 'string' &&
+        typeof retryable === 'boolean'
+      ) {
+        return {
+          code: code.slice(0, MAX_ERROR_CODE_LENGTH),
+          message: message.slice(0, MAX_ERROR_MESSAGE_LENGTH),
+          retryable,
+        };
+      }
+    }
+  }
+  return {
+    code: 'BACKEND_ERROR',
+    message: 'Локальний рушій повернув помилку',
+    retryable: status >= 500,
+  };
 }
 
 /** Removes the session token from text before it reaches a log. */

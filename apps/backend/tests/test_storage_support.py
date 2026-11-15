@@ -15,6 +15,7 @@ from clipforge.storage import (
     Source,
     SourceRepository,
 )
+from clipforge.storage.util import utc_now
 
 SHA256 = "a" * 64
 
@@ -23,8 +24,14 @@ def add_project(session: Session, name: str = "Проєкт") -> Project:
     return ProjectRepository(session).add(name)
 
 
-def add_source(session: Session, project_id: str, *, duration_ms: int = 60_000) -> Source:
-    return SourceRepository(session).add(
+def add_source(
+    session: Session,
+    project_id: str,
+    *,
+    duration_ms: int = 60_000,
+    now: Callable[[], str] = utc_now,
+) -> Source:
+    return SourceRepository(session, now=now).add(
         project_id=project_id,
         path="C:\\Відео\\запис.mkv",
         display_name="запис.mkv",
@@ -50,8 +57,9 @@ def add_clip(
     title: str = "Кліп",
     categories: Sequence[str] = ("funny",),
     review_status: str = "suggested",
+    now: Callable[[], str] = utc_now,
 ) -> Clip:
-    return ClipRepository(session).add(
+    return ClipRepository(session, now=now).add(
         source_id=source_id,
         title=title,
         start_ms=start_ms,

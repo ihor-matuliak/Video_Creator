@@ -8,13 +8,15 @@ from .errors import (
     StorageError,
     WorkspaceLocked,
 )
-from .models import Base, Clip, ExportBatch, ExportItem, Job, Project, Source
+from .models import Base, Clip, ExportBatch, ExportItem, Job, Preview, Project, Source
 from .repositories import (
     ClipRepository,
     ExportRepository,
     JobRepository,
     Page,
+    PreviewRepository,
     ProjectRepository,
+    ProjectSummary,
     SourceRepository,
 )
 
@@ -30,8 +32,11 @@ __all__ = [
     "JobRepository",
     "MigrationError",
     "Page",
+    "Preview",
+    "PreviewRepository",
     "Project",
     "ProjectRepository",
+    "ProjectSummary",
     "RecordNotFound",
     "Source",
     "SourceRepository",

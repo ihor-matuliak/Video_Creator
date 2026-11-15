@@ -13,6 +13,7 @@ from clipforge.adapters.media_tools import MediaTools
 from clipforge.services.clips import ClipService
 from clipforge.services.exports import EXPORT_JOB, ExportService
 from clipforge.services.jobs import JobRunner, JobService
+from clipforge.services.previews import PREVIEW_JOB, PreviewService
 from clipforge.services.projects import ProjectService
 from clipforge.services.sources import SourceService
 from clipforge.storage import Database, open_database
@@ -27,7 +28,10 @@ class Runtime:
         self.sources = SourceService(database, media_tools, self.runner)
         self.clips = ClipService(database)
         self.exports = ExportService(database, media_tools)
-        self.jobs = JobService(database, {EXPORT_JOB: self.exports.cancel})
+        self.previews = PreviewService(database, media_tools)
+        self.jobs = JobService(
+            database, {EXPORT_JOB: self.exports.cancel, PREVIEW_JOB: self.previews.cancel}
+        )
 
     @classmethod
     def start(cls, data_dir: Path, *, media_tools: MediaTools | None) -> Runtime:
@@ -37,6 +41,7 @@ class Runtime:
         try:
             runtime.runner.recover()
             runtime.exports.recover()
+            runtime.previews.recover()
         except BaseException:
             runtime.close()
             raise
@@ -44,9 +49,12 @@ class Runtime:
 
     def close(self) -> None:
         try:
-            self.exports.shutdown()
+            self.previews.shutdown()
         finally:
             try:
-                self.runner.shutdown()
+                self.exports.shutdown()
             finally:
-                self.database.close()
+                try:
+                    self.runner.shutdown()
+                finally:
+                    self.database.close()

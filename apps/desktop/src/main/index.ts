@@ -1,28 +1,39 @@
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, protocol, shell } from 'electron';
 
 import { APP_GET_STATUS_CHANNEL } from '../shared/bridge';
+import { ApiGateway, registerApiIpc } from './api-gateway';
 import { isTrustedSender } from './ipc-guard';
 import type { TrustedPage } from './ipc-guard';
+import { MEDIA_SCHEME_REGISTRATION, registerMediaProtocol } from './media-protocol';
 import { Sidecar } from './sidecar';
 import { resolveDataDir, resolveMode } from './sidecar-protocol';
+import { ViewStateStore, registerViewStateIpc } from './view-state';
 
 // Unpackaged layout: <repo>/apps/desktop/out/main/index.js. The packaged sidecar
 // bundle is M8 work; until then a missing interpreter simply reports "failed".
 const REPO_ROOT = resolve(__dirname, '../../../..');
 
+// Privileges of a custom scheme can only be granted before the app is ready.
+protocol.registerSchemesAsPrivileged([MEDIA_SCHEME_REGISTRATION]);
+
 const mode = resolveMode(process.env);
+// The workspace of this run: userData in production, CLIPFORGE_DATA_DIR in test mode. The
+// remembered project and tab live next to the database, so a test workspace never touches the
+// real one and a relaunch on the same workspace finds its own state.
+const dataDir = resolveDataDir(mode, process.env, app.getPath('userData'));
 const sidecar = new Sidecar({
   mode,
-  dataDir: resolveDataDir(mode, process.env, app.getPath('userData')),
+  dataDir,
   pythonPath: join(REPO_ROOT, '.venv', 'Scripts', 'python.exe'),
   cwd: join(REPO_ROOT, 'apps', 'backend'),
   env: process.env,
 });
 
 let trustedPage: TrustedPage | null = null;
+let mainWindow: BrowserWindow | null = null;
 
 /**
  * Dev renderer URL is injected by `electron-vite dev`. It is honoured only in
@@ -74,12 +85,33 @@ ipcMain.handle(APP_GET_STATUS_CHANNEL, (event) => {
   return sidecar.getStatus();
 });
 
+// The renderer's only route to the backend: api:call, dialog:import-video, dialog:pick-video,
+// drop:video, export:choose-folder and export:open-folder. Each handler checks the sender; the
+// session token and port never leave `sidecar`. `dialog` is passed as the object
+// itself so that a replaced `dialog.showOpenDialog` (E2E) is picked up at call time.
+registerApiIpc(
+  ipcMain,
+  new ApiGateway({
+    backend: sidecar,
+    dialog,
+    shell,
+    getWindow: () => mainWindow,
+    getTrustedPage: () => trustedPage,
+  }),
+);
+
+// The project and tab shown last, so a restart reopens them (docs/03 section 12).
+registerViewStateIpc(ipcMain, new ViewStateStore(dataDir), () => trustedPage);
+
 function createMainWindow(): void {
   const window = new BrowserWindow({
+    // Sizes are those of the page, not of the frame around it: the smallest window shows a
+    // 1100x720 page, which is the size the layout is checked at (docs/03 sections 8 and 12).
+    useContentSize: true,
     width: 1280,
     height: 800,
-    minWidth: 960,
-    minHeight: 600,
+    minWidth: 1100,
+    minHeight: 720,
     show: false,
     title: 'ClipForge Local',
     backgroundColor: '#0F172A',
@@ -99,8 +131,10 @@ function createMainWindow(): void {
   const pageUrl =
     devUrl ?? pathToFileURL(join(__dirname, '../renderer/index.html')).href;
   trustedPage = { webContentsId: window.webContents.id, pageUrl };
+  mainWindow = window;
   window.on('closed', () => {
     trustedPage = null;
+    mainWindow = null;
   });
 
   const loading =
@@ -115,6 +149,8 @@ function createMainWindow(): void {
 }
 
 void app.whenReady().then(() => {
+  // app-media://source|preview/<uuid4> -> the sidecar's media routes, with Range.
+  registerMediaProtocol(protocol, sidecar);
   sidecar.start();
   createMainWindow();
 });

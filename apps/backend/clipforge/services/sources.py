@@ -13,7 +13,7 @@ import os
 import stat
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, BinaryIO, Final
 
 from clipforge.adapters.ffprobe import ProbeError, SourceProbe, probe_source
 from clipforge.adapters.fingerprint import quick_fingerprint, sha256_file
@@ -23,13 +23,21 @@ from clipforge.services.errors import (
     bad_request,
     conflict,
     invalid,
+    invalid_cursor,
     media_tools_unavailable,
     not_found,
 )
 from clipforge.services.jobs import HASH_PENDING, JobRunner, add_source_hash_job
 from clipforge.services.source_files import AVAILABLE, current_availability
 from clipforge.services.text import is_storable
-from clipforge.storage import Database, JobRepository, ProjectRepository, Source, SourceRepository
+from clipforge.storage import (
+    Database,
+    JobRepository,
+    Page,
+    ProjectRepository,
+    Source,
+    SourceRepository,
+)
 
 _FILE_ERRORS: Final = {
     "SOURCE_UNAVAILABLE": ("Файл джерела недоступний: перевірте шлях і права доступу", False),
@@ -44,6 +52,15 @@ _FILE_ERRORS: Final = {
 class RegisteredSource:
     source: Source
     hash_job_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class OpenedMedia:
+    """A registered source file opened read-only. The caller must close ``file``."""
+
+    file: BinaryIO
+    size: int
+    extension: str
 
 
 class SourceService:
@@ -100,6 +117,57 @@ class SourceService:
             return source
         with self._database.write_session() as session:
             return SourceRepository(session).set_availability(source_id, availability)
+
+    def list_page(self, project_id: str, *, limit: int, cursor: str | None) -> Page[Source]:
+        """One page of the project's sources, each with ``availability`` refreshed like ``get``."""
+        with self._database.session() as session:
+            if ProjectRepository(session).get(project_id) is None:
+                raise not_found("PROJECT_NOT_FOUND", "Проєкт не знайдено")
+            try:
+                page = SourceRepository(session).list_page_for_project(
+                    project_id, limit=limit, after=cursor
+                )
+            except ValueError:
+                raise invalid_cursor() from None
+        changed = {
+            source.id: availability
+            for source in page.items
+            if (availability := current_availability(source)) != source.availability
+        }
+        if not changed:
+            return page
+        with self._database.write_session() as session:
+            repo = SourceRepository(session)
+            items = [
+                repo.set_availability(source.id, changed[source.id])
+                if source.id in changed
+                else source
+                for source in page.items
+            ]
+        return Page(items=items, next_cursor=page.next_cursor)
+
+    def open_media(self, source_id: str) -> OpenedMedia:
+        """Open the registered file read-only for playback.
+
+        The size and mtime are checked on the open handle, so the bytes served are those of the
+        file that was registered, even if the path is replaced right after the check.
+        """
+        with self._database.session() as session:
+            source = _require_source(SourceRepository(session), source_id)
+        try:
+            handle = Path(source.path).open("rb")  # noqa: SIM115 - closed by the caller
+        except OSError:
+            raise _file_error("SOURCE_UNAVAILABLE") from None
+        try:
+            state = os.fstat(handle.fileno())
+            if not stat.S_ISREG(state.st_mode):
+                raise _file_error("SOURCE_UNAVAILABLE")
+            if state.st_size != source.size or state.st_mtime_ns != source.mtime:
+                raise _file_error("SOURCE_CHANGED")
+        except BaseException:
+            handle.close()
+            raise
+        return OpenedMedia(file=handle, size=state.st_size, extension=Path(source.path).suffix)
 
     def relink(self, source_id: str, raw_path: str) -> Source:
         """Point the source at ``raw_path`` when that file has the same full SHA-256."""
@@ -218,6 +286,15 @@ def _canonical_origin(probe: SourceProbe) -> dict[str, Any]:
 
 
 def _probe_summary(probe: SourceProbe) -> dict[str, Any]:
+    """The probe fields stored as JSON on the source and served as ``SourceOut.probe``.
+
+    ``frame_rate`` is the average rate of the main video stream as a fraction string
+    (``"30000/1001"``), ``null`` when unknown. ``vfr`` is ``true`` for variable frame rate,
+    ``false`` for constant, ``null`` when not determined. Both come from the timestamps of
+    the video packets (see ``analyze_frame_timing``). Sources registered before these keys
+    existed do not have them at all.
+    """
+    rate = probe.frame_rate
     return {
         "format_name": probe.format_name,
         "video_codec": probe.video_codec,
@@ -226,4 +303,6 @@ def _probe_summary(probe: SourceProbe) -> dict[str, Any]:
         "rotation": probe.rotation,
         "hdr": probe.hdr,
         "unsupported_reason": probe.unsupported_reason,
+        "frame_rate": None if rate is None else f"{rate.numerator}/{rate.denominator}",
+        "vfr": probe.vfr,
     }

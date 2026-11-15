@@ -37,6 +37,8 @@ DB_FILENAME: Final = "clipforge.sqlite3"
 LOCK_FILENAME: Final = "workspace.lock"
 BACKUP_DIRNAME: Final = "backups"
 BUSY_TIMEOUT_MS: Final = 5000
+# SQL function ``clipforge_casefold(text)``: Python ``str.casefold``, set on every connection.
+CASEFOLD_FUNCTION: Final = "clipforge_casefold"
 
 _BEGIN_OPTION: Final = "clipforge_begin"
 _BEGIN_STATEMENTS: Final = {"DEFERRED": "BEGIN", "IMMEDIATE": "BEGIN IMMEDIATE"}
@@ -137,6 +139,12 @@ def _on_connect(dbapi_connection: DBAPIConnection, _record: ConnectionPoolEntry)
         cursor.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     finally:
         cursor.close()
+    # SQLite's own lower()/LIKE fold only ASCII; the project search needs Unicode case folding.
+    dbapi_connection.create_function(CASEFOLD_FUNCTION, 1, _casefold, deterministic=True)
+
+
+def _casefold(value: object) -> str | None:
+    return value.casefold() if isinstance(value, str) else None
 
 
 def _on_begin(connection: Connection) -> None:

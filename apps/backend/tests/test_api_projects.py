@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
+
 import pytest
 from fastapi.testclient import TestClient
 
 from clipforge.services.runtime import Runtime
-from clipforge.storage import ProjectRepository
+from clipforge.storage import ClipRepository, ExportRepository, ProjectRepository
+
+from .test_storage_support import add_clip, add_source, counting_clock
+
+STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z")
 
 
 def create(client: TestClient, name: object) -> tuple[int, dict[str, object]]:
@@ -32,6 +39,30 @@ def error_of(body: dict[str, object]) -> dict[str, object]:
 
 def listed_ids(client: TestClient, **params: str) -> list[object]:
     return [item["id"] for item in client.get("/v1/projects", params=params).json()["items"]]
+
+
+def listed_names(client: TestClient, **params: str) -> list[object]:
+    return [item["name"] for item in client.get("/v1/projects", params=params).json()["items"]]
+
+
+def listed_item(client: TestClient, project_id: object) -> dict[str, object]:
+    items = client.get("/v1/projects", params={"include_archived": "true"}).json()["items"]
+    (item,) = (item for item in items if item["id"] == project_id)
+    result: dict[str, object] = item
+    return result
+
+
+def at(stamp: str) -> Callable[[], str]:
+    """A clock stuck at ``<stamp>``, a full ISO timestamp."""
+    return lambda: stamp
+
+
+def seed(runtime: Runtime, *names: str) -> list[str]:
+    """Projects with strictly increasing creation times: the list order is the argument order
+    (POST uses the real clock, whose ticks can tie)."""
+    with runtime.database.write_session() as session:
+        repo = ProjectRepository(session, now=counting_clock())
+        return [repo.add(name).id for name in names]
 
 
 def test_create_returns_201_with_id_and_trimmed_name(client: TestClient) -> None:
@@ -335,3 +366,271 @@ def test_patch_without_token_is_401_and_changes_nothing(
     response = anonymous.patch(f"/v1/projects/{project_id}", json={"name": "Зламаний"})
     assert response.status_code == 401
     assert client.get("/v1/projects").json()["items"][0]["name"] == "Захищений"
+
+
+# --- search (q) -------------------------------------------------------------------------------
+
+
+def test_search_finds_a_substring_of_the_name_ignoring_case(client: TestClient) -> None:
+    for name in ("Київ запис", "Одеса", "Straße", "ІГОР"):
+        create(client, name)
+    assert listed_names(client, q="київ") == ["Київ запис"]
+    assert listed_names(client, q="КИЇВ") == ["Київ запис"]
+    assert listed_names(client, q="ЗАПИС") == ["Київ запис"]
+    assert listed_names(client, q="ігор") == ["ІГОР"]
+    assert listed_names(client, q="STRASSE") == ["Straße"]
+    assert listed_names(client, q="  одес  ") == ["Одеса"]
+
+
+def test_search_without_a_match_is_an_empty_page(client: TestClient) -> None:
+    create(client, "Київ запис")
+    assert client.get("/v1/projects", params={"q": "харків"}).json() == {
+        "items": [],
+        "next_cursor": None,
+    }
+
+
+@pytest.mark.parametrize("q", ["", " ", "\t \n"])
+def test_empty_search_does_not_filter(client: TestClient, runtime: Runtime, q: str) -> None:
+    seed(runtime, "Перший", "Другий")
+    assert listed_names(client, q=q) == ["Перший", "Другий"]
+
+
+def test_search_treats_like_wildcards_as_text(client: TestClient, runtime: Runtime) -> None:
+    seed(runtime, "100% готово", "a_b", "abc")
+    assert listed_names(client, q="%") == ["100% готово"]
+    assert listed_names(client, q="_") == ["a_b"]
+
+
+def test_search_follows_a_rename(client: TestClient) -> None:
+    project_id = create(client, "Старе")[1]["id"]
+    patch_project(client, project_id, {"name": "Нове Львів"})
+    assert listed_ids(client, q="старе") == []
+    assert listed_ids(client, q="львів") == [project_id]
+
+
+def test_search_of_200_characters_is_accepted_and_201_is_422(client: TestClient) -> None:
+    create(client, "я" * 120)
+    assert client.get("/v1/projects", params={"q": "я" * 200}).status_code == 200
+    long = "Київ" * 51
+    assert len(long) == 204
+    response = client.get("/v1/projects", params={"q": long})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert long not in response.text
+    assert client.get("/v1/projects", params={"q": "я" * 201}).status_code == 422
+
+
+@pytest.mark.parametrize("raw", ["%00", "a%00b", "%ED%A0%80", "%FF"])
+def test_search_with_nul_or_invalid_utf8_matches_nothing(client: TestClient, raw: str) -> None:
+    create(client, "Проєкт")
+    response = client.get(f"/v1/projects?q={raw}")
+    assert response.status_code == 200
+    assert response.json() == {"items": [], "next_cursor": None}
+
+
+def test_search_with_include_archived(client: TestClient, runtime: Runtime) -> None:
+    visible, hidden, lviv = seed(runtime, "Київ відкритий", "Київ архівний", "Львів")
+    patch_project(client, hidden, {"archived": True})
+    assert listed_ids(client, q="київ") == [visible]
+    assert listed_ids(client, q="київ", include_archived="false") == [visible]
+    assert listed_ids(client, q="київ", include_archived="true") == [visible, hidden]
+    assert listed_ids(client, q="львів", include_archived="true") == [lviv]
+
+
+def test_search_pages_with_a_cursor_cover_every_match_once(
+    client: TestClient, runtime: Runtime
+) -> None:
+    names = [f"Київ {n}" if n % 2 == 0 else f"Львів {n}" for n in range(11)]
+    created = seed(runtime, *names)
+    matches = [
+        project_id for project_id, name in zip(created, names, strict=True) if "Київ" in name
+    ]
+    assert len(matches) == 6
+
+    seen: list[object] = []
+    cursor: str | None = None
+    pages = 0
+    while True:
+        params = {"q": "київ", "limit": "2"} | ({"cursor": cursor} if cursor else {})
+        body = client.get("/v1/projects", params=params).json()
+        assert 1 <= len(body["items"]) <= 2
+        assert all("Київ" in item["name"] for item in body["items"])
+        seen.extend(item["id"] for item in body["items"])
+        pages += 1
+        cursor = body["next_cursor"]
+        if cursor is None:
+            break
+    assert seen == matches
+    assert pages == 3
+
+
+def test_search_cursor_may_point_to_a_project_the_search_does_not_show(
+    client: TestClient, runtime: Runtime
+) -> None:
+    first, other, second = seed(runtime, "Київ 1", "Львів", "Київ 2")
+    assert listed_ids(client, q="київ", cursor=other) == [second]
+    assert listed_ids(client, q="київ", cursor=first) == [second]
+    response = client.get("/v1/projects", params={"q": "київ", "cursor": "no-such-project"})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "INVALID_CURSOR"
+
+
+def test_search_pages_with_archived_projects_and_a_cursor(
+    client: TestClient, runtime: Runtime
+) -> None:
+    ids = seed(runtime, *(f"Київ {n}" for n in range(5)))
+    patch_project(client, ids[1], {"archived": True})
+    patch_project(client, ids[3], {"archived": True})
+    page = client.get("/v1/projects", params={"q": "київ", "limit": "2"}).json()
+    assert [item["id"] for item in page["items"]] == [ids[0], ids[2]]
+    page = client.get(
+        "/v1/projects", params={"q": "київ", "limit": "2", "cursor": page["next_cursor"]}
+    ).json()
+    assert [item["id"] for item in page["items"]] == [ids[4]]
+    assert page["next_cursor"] is None
+    everything = client.get(
+        "/v1/projects", params={"q": "київ", "limit": "2", "include_archived": "true"}
+    ).json()
+    assert [item["id"] for item in everything["items"]] == ids[:2]
+    assert everything["next_cursor"] == ids[1]
+
+
+# --- source_count, clip_count and last_activity_at --------------------------------------------
+
+LATER = "2999-01-01T10:00:00.000000Z"
+LATEST = "2999-01-01T11:00:00.000000Z"
+EARLIER = "2000-01-01T10:00:00.000000Z"
+
+
+def test_a_new_project_has_no_sources_or_clips(client: TestClient) -> None:
+    created = create(client, "Порожній")[1]
+    item = listed_item(client, created["id"])
+    assert item["source_count"] == 0
+    assert item["clip_count"] == 0
+    assert item["last_activity_at"] == created["updated_at"]
+    assert isinstance(item["last_activity_at"], str)
+    assert STAMP.fullmatch(item["last_activity_at"])
+
+
+def test_list_item_is_the_post_shape_plus_the_figures(client: TestClient) -> None:
+    created = create(client, "A")[1]
+    item = listed_item(client, created["id"])
+    assert set(item) == set(created) | {"source_count", "clip_count", "last_activity_at"}
+    for key, value in created.items():
+        assert item[key] == value
+
+
+def test_post_and_patch_do_not_carry_the_figures(client: TestClient) -> None:
+    created = create(client, "A")[1]
+    _, patched = patch_project(client, created["id"], {"name": "B"})
+    figures = {"source_count", "clip_count", "last_activity_at"}
+    assert not figures & set(created)
+    assert not figures & set(patched)
+    assert set(created) == {"id", "name", "created_at", "updated_at", "archived_at"}
+    assert set(patched) == set(created) | {"archived"}
+
+
+def test_counts_and_last_activity_follow_a_source_a_clip_and_an_export_batch(
+    client: TestClient, runtime: Runtime
+) -> None:
+    project_id = str(create(client, "Проєкт")[1]["id"])
+    other_id = str(create(client, "Інший")[1]["id"])
+
+    with runtime.database.write_session() as session:
+        first = add_source(session, project_id, now=at(LATER))
+    item = listed_item(client, project_id)
+    assert (item["source_count"], item["clip_count"]) == (1, 0)
+    assert item["last_activity_at"] == LATER
+
+    with runtime.database.write_session() as session:
+        second = add_source(session, project_id, now=at(EARLIER))
+        add_clip(session, first.id, now=at(LATER))
+        add_clip(session, second.id, start_ms=6_000, end_ms=9_000, now=at(LATEST))
+    item = listed_item(client, project_id)
+    assert (item["source_count"], item["clip_count"]) == (2, 2)
+    assert item["last_activity_at"] == LATEST
+
+    batch_at = "2999-01-01T12:00:00.000000Z"
+    with runtime.database.write_session() as session:
+        ExportRepository(session, now=at(batch_at)).add_batch(
+            project_id=project_id, output_dir="C:\\Експорт", profile_json={}, status="queued"
+        )
+    item = listed_item(client, project_id)
+    assert (item["source_count"], item["clip_count"]) == (2, 2)
+    assert item["last_activity_at"] == batch_at
+
+    # Another project is not affected by any of it.
+    untouched = listed_item(client, other_id)
+    assert (untouched["source_count"], untouched["clip_count"]) == (0, 0)
+    assert untouched["last_activity_at"] != batch_at
+
+
+def test_a_clip_edit_moves_last_activity(client: TestClient, runtime: Runtime) -> None:
+    project_id = str(create(client, "Проєкт")[1]["id"])
+    with runtime.database.write_session() as session:
+        source = add_source(session, project_id, now=at(LATER))
+        clip = add_clip(session, source.id, now=at(LATER))
+    assert listed_item(client, project_id)["last_activity_at"] == LATER
+    with runtime.database.write_session() as session:
+        ClipRepository(session, now=at(LATEST)).update(
+            clip.id, expected_revision=1, title="Нова назва"
+        )
+    item = listed_item(client, project_id)
+    assert item["clip_count"] == 1
+    assert item["last_activity_at"] == LATEST
+
+
+def test_renaming_after_the_last_activity_makes_the_rename_the_last_activity(
+    client: TestClient, runtime: Runtime
+) -> None:
+    project_id = str(create(client, "Проєкт")[1]["id"])
+    with runtime.database.write_session() as session:
+        source = add_source(session, project_id, now=at(EARLIER))
+        add_clip(session, source.id, now=at(EARLIER))
+    _, renamed = patch_project(client, project_id, {"name": "Нова назва"})
+    item = listed_item(client, project_id)
+    assert item["last_activity_at"] == renamed["updated_at"]
+    assert (item["source_count"], item["clip_count"]) == (1, 1)
+
+
+def test_figures_of_a_whole_page_match_each_project(client: TestClient, runtime: Runtime) -> None:
+    ids = seed(runtime, *(f"Проєкт {n}" for n in range(4)))
+    with runtime.database.write_session() as session:
+        # Project n has n sources with n clips each.
+        for n, project_id in enumerate(ids):
+            for _ in range(n):
+                source = add_source(session, project_id, now=at(LATER))
+                for k in range(n):
+                    add_clip(
+                        session,
+                        source.id,
+                        start_ms=k * 1_000,
+                        end_ms=k * 1_000 + 500,
+                        now=at(LATEST),
+                    )
+    items = client.get("/v1/projects").json()["items"]
+    assert [item["id"] for item in items] == ids
+    assert [(item["source_count"], item["clip_count"]) for item in items] == [
+        (0, 0),
+        (1, 1),
+        (2, 4),
+        (3, 9),
+    ]
+    assert items[0]["last_activity_at"] == items[0]["updated_at"]
+    assert [item["last_activity_at"] for item in items[1:]] == [LATEST] * 3
+
+
+def test_figures_are_present_on_searched_and_archived_items(
+    client: TestClient, runtime: Runtime
+) -> None:
+    project_id = str(create(client, "Київ запис")[1]["id"])
+    with runtime.database.write_session() as session:
+        add_clip(session, add_source(session, project_id, now=at(EARLIER)).id, now=at(EARLIER))
+    patch_project(client, project_id, {"archived": True})
+    (item,) = client.get("/v1/projects", params={"q": "київ", "include_archived": "true"}).json()[
+        "items"
+    ]
+    assert (item["source_count"], item["clip_count"]) == (1, 1)
+    # Archiving is the project's own update, so it is the latest activity.
+    assert item["last_activity_at"] == item["updated_at"]

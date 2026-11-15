@@ -10,10 +10,12 @@ import hashlib
 import json
 import os
 import shutil
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
 
+from clipforge.adapters import ffprobe as ffprobe_module
 from clipforge.adapters.ffprobe import (
     HDR_UNSUPPORTED,
     ProbeTimeoutError,
@@ -21,6 +23,7 @@ from clipforge.adapters.ffprobe import (
     SourceProbe,
     SourceUnavailableError,
     SourceUnreadableError,
+    analyze_frame_timing,
     probe_source,
 )
 from clipforge.adapters.media_tools import (
@@ -178,6 +181,155 @@ def test_vfr_duration_from_packets(tools: MediaTools) -> None:
     assert result.origin_ms == 0
     assert 8900 <= result.duration_ms <= 9000
     assert result.audio_streams == ()
+
+
+# --- frame rate and VFR ---------------------------------------------------------------
+
+
+def test_vfr_fixture_is_flagged_vfr_with_its_average_rate(tools: MediaTools) -> None:
+    result = probe(tools, fixture("vfr.mkv"))
+    assert result.vfr is True
+    # ffprobe reports 30/1 for this Matroska file (the first 90 frames); the real
+    # average is 179 intervals over 8.933 s: 3 s at 30 fps, then 15 fps.
+    assert result.frame_rate is not None
+    assert 20.0 < float(result.frame_rate) < 20.1
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["color_gop.mp4", "no_audio.mp4", "two_tracks.mkv", "audio_offset.mkv", "Київ запис.mp4"],
+)
+def test_constant_rate_fixtures_are_not_vfr(tools: MediaTools, name: str) -> None:
+    result = probe(tools, fixture(name))
+    assert result.vfr is False
+    assert result.frame_rate == Fraction(30)
+
+
+@pytest.mark.parametrize("container", ["mkv", "mp4"])
+def test_ntsc_rate_survives_millisecond_rounding(
+    tools: MediaTools, tmp_path: Path, container: str
+) -> None:
+    target = tmp_path / f"ntsc.{container}"
+    ffmpeg(
+        tools,
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=64x64:rate=30000/1001:duration=10",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        str(target),
+    )
+    result = probe(tools, target)
+    assert result.vfr is False  # Matroska timestamps alternate 33 and 34 ms
+    assert result.frame_rate == Fraction(30000, 1001)
+
+
+def test_reordered_b_frames_are_not_vfr(tools: MediaTools, tmp_path: Path) -> None:
+    target = tmp_path / "bframes.mkv"
+    ffmpeg(
+        tools,
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=64x64:rate=24000/1001:duration=10",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-bf",
+        "3",
+        "-pix_fmt",
+        "yuv420p",
+        str(target),
+    )
+    result = probe(tools, target)
+    assert result.vfr is False
+    assert result.frame_rate == Fraction(24000, 1001)
+
+
+def test_vfr_in_mp4_is_flagged_vfr(tools: MediaTools, tmp_path: Path) -> None:
+    target = tmp_path / "vfr.mp4"
+    ffmpeg(
+        tools,
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=64x64:rate=30:duration=6",
+        "-vf",
+        "setpts='if(lt(N,90),N/(30*TB),(3+(N-90)/15)/TB)'",
+        "-fps_mode",
+        "vfr",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        str(target),
+    )
+    result = probe(tools, target)
+    assert result.vfr is True
+    assert result.frame_rate is not None
+    assert 20.0 < float(result.frame_rate) < 20.1
+
+
+def test_scan_timeout_leaves_vfr_unknown_and_keeps_the_container_rate(
+    tools: MediaTools, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ffprobe_module, "FRAME_SCAN_TIMEOUT_S", 0.000001)
+    result = probe(tools, fixture("color_gop.mp4"))
+    assert result.vfr is None
+    assert result.frame_rate == Fraction(30)  # avg_frame_rate from the container
+    assert result.duration_ms == 12000  # the rest of the probe is unaffected
+
+
+MS = Fraction(1, 1000)
+
+
+def test_analyze_constant_rate_with_rounded_timestamps() -> None:
+    pts = [round(i * 1001 / 30) for i in range(300)]  # 29.97 fps on a millisecond base
+    rate, vfr = analyze_frame_timing(pts, MS)
+    assert vfr is False
+    assert rate is not None
+    assert abs(float(rate) - 30000 / 1001) < 0.01
+    assert analyze_frame_timing(pts, MS, Fraction(30000, 1001)) == (Fraction(30000, 1001), False)
+
+
+def test_analyze_prefers_the_measured_rate_when_the_reported_one_is_off() -> None:
+    pts = [i * 40 for i in range(100)]  # exactly 25 fps
+    assert analyze_frame_timing(pts, MS, Fraction(30)) == (Fraction(25), False)
+
+
+def test_analyze_orders_and_deduplicates_timestamps() -> None:
+    shuffled = [67, 0, 33, 33, 133, 100, 167, 200, 167]
+    rate, vfr = analyze_frame_timing(shuffled, MS)
+    assert vfr is False
+    assert rate == Fraction(6 * 1000, 200)
+
+
+def test_analyze_one_tick_of_rounding_is_constant_two_ticks_are_not() -> None:
+    assert analyze_frame_timing([0, 33, 67, 100], MS)[1] is False  # 33, 34, 33
+    assert analyze_frame_timing([0, 33, 68, 101], MS)[1] is True  # 33, 35, 33
+
+
+def test_analyze_dropped_frame_and_rate_change_are_vfr() -> None:
+    assert analyze_frame_timing([0, 33, 67, 133, 167, 200], MS)[1] is True
+    changed = [i * 33 for i in range(90)] + [3000 + i * 67 for i in range(90)]
+    rate, vfr = analyze_frame_timing(changed, MS, Fraction(30))
+    assert vfr is True
+    assert rate is not None
+    assert float(rate) < 25  # the average, not the reported 30
+
+
+@pytest.mark.parametrize("pts", [[], [0], [5, 5, 5]])
+def test_analyze_too_few_timestamps_decide_nothing(pts: list[int]) -> None:
+    assert analyze_frame_timing(pts, MS) == (None, None)
+    assert analyze_frame_timing(pts, MS, Fraction(25)) == (Fraction(25), None)
 
 
 def test_cyrillic_fixture(tools: MediaTools) -> None:

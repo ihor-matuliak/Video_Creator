@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from clipforge.services.errors import ServiceError, invalid, invalid_cursor, not_found
 from clipforge.services.text import clean_text
-from clipforge.storage import Database, Page, Project, ProjectRepository
+from clipforge.storage import Database, Page, Project, ProjectRepository, ProjectSummary
 
 PROJECT_NAME_MAX = 120
 
@@ -20,15 +20,27 @@ class ProjectService:
             return ProjectRepository(session).add(clean)
 
     def list_page(
-        self, *, limit: int, cursor: str | None, include_archived: bool = False
-    ) -> Page[Project]:
+        self,
+        *,
+        limit: int,
+        cursor: str | None,
+        include_archived: bool = False,
+        query: str | None = None,
+    ) -> Page[ProjectSummary]:
+        """A page of projects with their source and clip counts and last activity.
+
+        ``query`` searches the name (see ``ProjectRepository.list_page``); order and cursor are
+        the same with or without it. Counts come from one read transaction with the page.
+        """
         with self._database.session() as session:
+            repo = ProjectRepository(session)
             try:
-                return ProjectRepository(session).list_page(
-                    limit=limit, after=cursor, include_archived=include_archived
+                page = repo.list_page(
+                    limit=limit, after=cursor, include_archived=include_archived, query=query
                 )
             except ValueError:
                 raise invalid_cursor() from None
+            return Page(items=repo.summarize(page.items), next_cursor=page.next_cursor)
 
     def update(self, project_id: str, *, name: str | None, archived: bool | None) -> Project:
         """Rename and/or archive the project. ``None`` leaves a field as it is.

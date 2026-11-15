@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 
 from clipforge.storage import (
@@ -133,6 +135,164 @@ def test_pagination_rejects_bad_arguments(db: Database) -> None:
             repo.list_page(limit=0)
         with pytest.raises(ValueError, match="курсор"):
             repo.list_page(after="unknown")
+
+
+# --- project search and summary ---------------------------------------------------------------
+
+
+def names_found(db: Database, query: str | None, **kwargs: Any) -> list[str]:
+    with db.session() as session:
+        page = ProjectRepository(session).list_page(query=query, **kwargs)
+    return [project.name for project in page.items]
+
+
+def at(stamp: str) -> Callable[[], str]:
+    """A clock stuck at ``2026-11-13T<stamp>.000000Z``."""
+    return lambda: f"2026-11-13T{stamp}.000000Z"
+
+
+def test_search_folds_case_beyond_ascii(db: Database) -> None:
+    with db.session() as session:
+        repo = ProjectRepository(session, now=counting_clock())
+        for name in ("Київ запис", "Одеса", "Straße", "ІГОР"):
+            repo.add(name)
+    assert names_found(db, "київ") == ["Київ запис"]
+    assert names_found(db, "КИЇВ") == ["Київ запис"]
+    assert names_found(db, "ЗАПИС") == ["Київ запис"]
+    assert names_found(db, "игор") == []
+    assert names_found(db, "ігор") == ["ІГОР"]
+    # casefold, not lower(): "ß" folds to "ss" in both directions.
+    assert names_found(db, "STRASSE") == ["Straße"]
+    assert names_found(db, "straße") == ["Straße"]
+
+
+def test_search_is_a_trimmed_substring_and_empty_does_not_filter(db: Database) -> None:
+    with db.session() as session:
+        repo = ProjectRepository(session, now=counting_clock())
+        for name in ("Перший запис", "Другий", "100% готово", "a_b"):
+            repo.add(name)
+    assert names_found(db, "  ий зап  ") == ["Перший запис"]
+    everything = ["Перший запис", "Другий", "100% готово", "a_b"]
+    assert names_found(db, None) == everything
+    assert names_found(db, "") == everything
+    assert names_found(db, " \t ") == everything
+    assert names_found(db, "немає такого") == []
+    # LIKE wildcards are plain text.
+    assert names_found(db, "%") == ["100% готово"]
+    assert names_found(db, "_") == ["a_b"]
+
+
+def test_search_works_with_archived_and_cursor(db: Database) -> None:
+    with db.session() as session:
+        repo = ProjectRepository(session, now=counting_clock())
+        ids = [repo.add(name).id for name in ("Київ 1", "Львів", "Київ 2", "Київ 3", "Київ 4")]
+        repo.archive(ids[2])
+    assert names_found(db, "київ") == ["Київ 1", "Київ 3", "Київ 4"]
+    assert names_found(db, "київ", include_archived=True) == [
+        "Київ 1",
+        "Київ 2",
+        "Київ 3",
+        "Київ 4",
+    ]
+    # The cursor may be a project that the search does not show (Львів).
+    assert names_found(db, "київ", after=ids[1], include_archived=True) == [
+        "Київ 2",
+        "Київ 3",
+        "Київ 4",
+    ]
+    with db.session() as session:
+        repo = ProjectRepository(session)
+        first = repo.list_page(query="київ", limit=2, include_archived=True)
+        assert [p.name for p in first.items] == ["Київ 1", "Київ 2"]
+        assert first.next_cursor == ids[2]
+        rest = repo.list_page(query="київ", limit=2, after=first.next_cursor, include_archived=True)
+        assert [p.name for p in rest.items] == ["Київ 3", "Київ 4"]
+        assert rest.next_cursor is None
+        with pytest.raises(ValueError, match="курсор"):
+            repo.list_page(query="київ", after="unknown")
+
+
+def test_summarize_counts_sources_and_clips_per_project(db: Database) -> None:
+    with db.session() as session:
+        repo = ProjectRepository(session, now=at("10:00:00"))
+        busy, one_source, empty = (repo.add(name) for name in ("Багато", "Одне", "Порожній"))
+        first = add_source(session, busy.id, now=at("10:01:00"))
+        second = add_source(session, busy.id, now=at("10:02:00"))
+        add_clip(session, first.id, now=at("10:03:00"))
+        add_clip(session, first.id, start_ms=6_000, end_ms=9_000, now=at("10:04:00"))
+        add_clip(session, second.id, now=at("10:05:00"))
+        lone = add_source(session, one_source.id, now=at("10:06:00"))
+        # An unrelated clip of another project must not be counted for `busy`.
+        add_clip(session, lone.id, now=at("10:07:00"))
+        summaries = {
+            s.project.id: s for s in ProjectRepository(session).summarize([busy, one_source, empty])
+        }
+    assert (summaries[busy.id].source_count, summaries[busy.id].clip_count) == (2, 3)
+    assert (summaries[one_source.id].source_count, summaries[one_source.id].clip_count) == (1, 1)
+    assert (summaries[empty.id].source_count, summaries[empty.id].clip_count) == (0, 0)
+    assert summaries[busy.id].last_activity_at == "2026-11-13T10:05:00.000000Z"
+    assert summaries[one_source.id].last_activity_at == "2026-11-13T10:07:00.000000Z"
+    # No activity: the project's own timestamp.
+    assert summaries[empty.id].last_activity_at == "2026-11-13T10:00:00.000000Z"
+
+
+def test_summarize_keeps_the_order_of_its_argument(db: Database) -> None:
+    with db.session() as session:
+        repo = ProjectRepository(session, now=counting_clock())
+        projects = [repo.add(f"Проєкт {n}") for n in range(4)]
+        add_source(session, projects[1].id)
+        reordered = [projects[3], projects[1], projects[0]]
+        assert [s.project.id for s in repo.summarize(reordered)] == [p.id for p in reordered]
+        assert repo.summarize([]) == []
+
+
+def test_last_activity_is_the_latest_of_every_kind_of_activity(db: Database) -> None:
+    with db.session() as session:
+        project = ProjectRepository(session, now=at("10:00:00")).add("Проєкт")
+        repo = ProjectRepository(session)
+
+        def last() -> str:
+            return repo.summarize([project])[0].last_activity_at
+
+        assert last() == "2026-11-13T10:00:00.000000Z"
+        source = add_source(session, project.id, now=at("10:01:00"))
+        assert last() == "2026-11-13T10:01:00.000000Z"
+        clip = add_clip(session, source.id, now=at("10:02:00"))
+        assert last() == "2026-11-13T10:02:00.000000Z"
+        ClipRepository(session, now=at("10:03:00")).update(clip.id, expected_revision=1, title="Н")
+        assert last() == "2026-11-13T10:03:00.000000Z"
+        ExportRepository(session, now=at("10:04:00")).add_batch(
+            project_id=project.id, output_dir="C:\\Експорт", profile_json={}, status="queued"
+        )
+        assert last() == "2026-11-13T10:04:00.000000Z"
+        ProjectRepository(session, now=at("10:05:00")).rename(project.id, "Нова назва")
+        assert last() == "2026-11-13T10:05:00.000000Z"
+        # An older event never lowers the value.
+        add_source(session, project.id, now=at("09:00:00"))
+        assert last() == "2026-11-13T10:05:00.000000Z"
+
+
+def test_summarize_uses_two_queries_for_any_number_of_projects(db: Database) -> None:
+    with db.session() as session:
+        repo = ProjectRepository(session, now=counting_clock())
+        projects = [repo.add(f"Проєкт {n}") for n in range(8)]
+        for project in projects:
+            add_clip(session, add_source(session, project.id).id)
+
+    statements: list[str] = []
+
+    def record(_conn: object, _cursor: object, statement: str, *_rest: object) -> None:
+        statements.append(statement)
+
+    event.listen(db.engine, "before_cursor_execute", record)
+    try:
+        with db.session() as session:
+            summaries = ProjectRepository(session).summarize(projects)
+    finally:
+        event.remove(db.engine, "before_cursor_execute", record)
+    assert [(s.source_count, s.clip_count) for s in summaries] == [(1, 1)] * 8
+    selects = [s for s in statements if s.lstrip().upper().startswith("SELECT")]
+    assert len(selects) == 2
 
 
 # --- sources ----------------------------------------------------------------------------------

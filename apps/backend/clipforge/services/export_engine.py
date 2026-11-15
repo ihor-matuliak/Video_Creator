@@ -29,6 +29,11 @@ and compared after every render and right before the rename; any change aborts w
 ``SOURCE_CHANGED``. A quick fingerprint can be required before the start.
 
 FFmpeg runs only through ``run_process`` (owned job, no shell, no console window).
+
+``canonical_window``, ``video_chain``, ``audio_chain`` and the temp/identity/process helpers
+(``create_temp``, ``remove_quietly``, ``source_state``, ``ensure_unchanged``, ``check_fingerprint``,
+``raise_if_cancelled``, ``run_ffmpeg``, ``render_failure``) are public because the preview proxy
+(``preview_engine``) builds on the same recipe and plumbing instead of repeating them.
 """
 
 from __future__ import annotations
@@ -210,7 +215,7 @@ class _Plan:
 
 
 @dataclass(frozen=True, slots=True)
-class _SourceState:
+class SourceState:
     size: int
     mtime_ns: int
 
@@ -252,19 +257,19 @@ def export_clip(
         end_ms=request.end_ms,
     )
 
-    before = _source_state(source)
+    before = source_state(source)
     if request.expected_fingerprint is not None:
-        _check_fingerprint(source, request.expected_fingerprint)
+        check_fingerprint(source, request.expected_fingerprint)
     probe = probe_source(tools.ffprobe, source)
     if probe.unsupported_reason == HDR_UNSUPPORTED:
         raise HdrUnsupportedError("HDR-відео поки не підтримується для експорту")
     interval = validate_interval(request.start_ms, request.end_ms, probe.duration_ms)
     _check_audio_streams(probe, _requested_audio(request))
     plan = _make_plan(tools, request, probe, interval.start_ms, interval.end_ms)
-    _ensure_unchanged(source, before)
-    _raise_if_cancelled(cancel)
+    ensure_unchanged(source, before)
+    raise_if_cancelled(cancel)
 
-    temp = _create_temp(output_dir, request.task_id)
+    temp = create_temp(output_dir, request.task_id)
     finalized = False
     try:
         modes: tuple[SeekMode, ...] = (
@@ -279,13 +284,13 @@ def export_clip(
             break
         else:  # pragma: no cover - the last mode never asks for a retry
             raise OutputInvalidError("Не вдалося отримати коректний кліп")
-        _ensure_unchanged(source, before)
-        _raise_if_cancelled(cancel)
+        ensure_unchanged(source, before)
+        raise_if_cancelled(cancel)
         final = _finalize(temp, output_dir, basename)
         finalized = True
     finally:
         if not finalized:
-            _remove_quietly(temp)
+            remove_quietly(temp)
 
     start = Fraction(request.start_ms, 1000)
     return ExportResult(
@@ -339,10 +344,10 @@ def _check_audio_streams(probe: SourceProbe, indexes: tuple[int, ...]) -> None:
 def _make_plan(
     tools: MediaTools, request: ExportRequest, probe: SourceProbe, start_ms: int, end_ms: int
 ) -> _Plan:
-    origin = probe.origin_seconds
     width, height = (
         (probe.height, probe.width) if probe.rotation in (90, 270) else (probe.width, probe.height)
     )
+    start_text, end_text = canonical_window(probe, start_ms, end_ms)
     return _Plan(
         ffmpeg=tools.ffmpeg,
         source=request.source,
@@ -350,8 +355,8 @@ def _make_plan(
         audio_indexes=_requested_audio(request),
         start_ms=start_ms,
         end_ms=end_ms,
-        start_text=_decimal(origin + Fraction(start_ms, 1000), 6),
-        end_text=_decimal(origin + Fraction(end_ms, 1000), 6),
+        start_text=start_text,
+        end_text=end_text,
         seek_text=_decimal(Fraction(max(0, start_ms - PRESEEK_MARGIN_MS), 1000), 3),
         width=width + width % 2,
         height=height + height % 2,
@@ -393,24 +398,24 @@ def _profile(with_audio: bool) -> dict[str, str | int]:
 # --- source identity --------------------------------------------------------------------
 
 
-def _source_state(source: Path) -> _SourceState:
+def source_state(source: Path) -> SourceState:
     try:
         stat = source.stat()
     except OSError:
         raise SourceUnavailableError("Файл джерела недоступний") from None
-    return _SourceState(size=stat.st_size, mtime_ns=stat.st_mtime_ns)
+    return SourceState(size=stat.st_size, mtime_ns=stat.st_mtime_ns)
 
 
-def _ensure_unchanged(source: Path, before: _SourceState) -> None:
+def ensure_unchanged(source: Path, before: SourceState) -> None:
     try:
-        now = _source_state(source)
+        now = source_state(source)
     except SourceUnavailableError:
         raise SourceChangedError("Файл джерела змінився під час експорту") from None
     if now != before:
         raise SourceChangedError("Файл джерела змінився під час експорту")
 
 
-def _check_fingerprint(source: Path, expected: str) -> None:
+def check_fingerprint(source: Path, expected: str) -> None:
     try:
         actual = quick_fingerprint(source)
     except OSError:
@@ -419,7 +424,7 @@ def _check_fingerprint(source: Path, expected: str) -> None:
         raise SourceChangedError("Файл джерела відрізняється від зареєстрованого")
 
 
-def _raise_if_cancelled(cancel: threading.Event | None) -> None:
+def raise_if_cancelled(cancel: threading.Event | None) -> None:
     if cancel is not None and cancel.is_set():
         raise ExportCancelledError("Експорт скасовано")
 
@@ -427,7 +432,7 @@ def _raise_if_cancelled(cancel: threading.Event | None) -> None:
 # --- temp and final files ---------------------------------------------------------------
 
 
-def _create_temp(output_dir: Path, task_id: str) -> Path:
+def create_temp(output_dir: Path, task_id: str) -> Path:
     """Create the empty temp file exclusively; its name is unique to the task."""
     temp = output_dir / f"{TEMP_PREFIX}{task_id.lower()}{TEMP_SUFFIX}"
     try:
@@ -440,7 +445,7 @@ def _create_temp(output_dir: Path, task_id: str) -> Path:
     return temp
 
 
-def _remove_quietly(temp: Path) -> None:
+def remove_quietly(temp: Path) -> None:
     """Delete the task's own temp file; the FFmpeg processes have already exited."""
     for _ in range(_REMOVE_ATTEMPTS):
         try:
@@ -475,28 +480,57 @@ def _render_and_verify(
     plan: _Plan,
     temp: Path,
     mode: SeekMode,
-    before: _SourceState,
+    before: SourceState,
     cancel: threading.Event | None,
     on_progress: ExportProgressCallback | None,
 ) -> _Observed:
     argv = _render_argv(plan, temp, mode)
-    result, frames = _run_ffmpeg(argv, "render", cancel, on_progress)
+    result, frames = run_ffmpeg(argv, "render", cancel, on_progress)
     if result.cancelled:
         raise ExportCancelledError("Експорт скасовано")
     if result.exit_code != 0:
         if not frames:
             _raise_if_no_frames(plan, mode, cancel)
-        raise _render_failure(result, temp.parent)
-    _ensure_unchanged(plan.source, before)
+        raise render_failure(result, temp.parent)
+    ensure_unchanged(plan.source, before)
     return _verify(tools, plan, temp, mode, cancel, on_progress)
 
 
-def _video_chain(plan: _Plan) -> str:
+def canonical_window(probe: SourceProbe, start_ms: int, end_ms: int) -> tuple[str, str]:
+    """``S`` and ``E`` of the ADR 018 filters: the container seconds of ``start_ms`` and ``end_ms``
+    (canonical origin plus the time), as exact decimal text. Shared with the preview proxy."""
+    origin = probe.origin_seconds
     return (
-        f"[0:{plan.video_index}]trim=start={plan.start_text}:end={plan.end_text},"
-        f"setpts=PTS-{plan.start_text}/TB,"
+        _decimal(origin + Fraction(start_ms, 1000), 6),
+        _decimal(origin + Fraction(end_ms, 1000), 6),
+    )
+
+
+def video_chain(
+    video_index: int, start_text: str, end_text: str, *, scale_height: int | None = None
+) -> str:
+    """The ADR 018 video chain ``[0:V]trim,setpts[,scale],pad[v]``. ``scale_height`` (even) scales
+    to that height keeping the aspect, only for the preview proxy; the export never scales."""
+    scale = f"scale=w=-2:h={scale_height}," if scale_height is not None else ""
+    return (
+        f"[0:{video_index}]trim=start={start_text}:end={end_text},"
+        f"setpts=PTS-{start_text}/TB,"
+        f"{scale}"
         "pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2[v]"
     )
+
+
+def audio_chain(audio_index: int, position: int, start_text: str, end_text: str) -> str:
+    """The ADR 018 audio chain ``[0:A]atrim,asetpts,aresample[a<position>]``: ``first_pts=0`` pads
+    the stream's own late start with silence."""
+    return (
+        f"[0:{audio_index}]atrim=start={start_text}:end={end_text},"
+        f"asetpts=PTS-{start_text}/TB,aresample=async=1:first_pts=0[a{position}]"
+    )
+
+
+def _video_chain(plan: _Plan) -> str:
+    return video_chain(plan.video_index, plan.start_text, plan.end_text)
 
 
 def _raise_if_no_frames(plan: _Plan, mode: SeekMode, cancel: threading.Event | None) -> None:
@@ -540,7 +574,7 @@ def _interval_has_no_frames(plan: _Plan, mode: SeekMode, cancel: threading.Event
         "null",
         "-",
     ]
-    result, frames = _run_ffmpeg(argv, "render", cancel, None)
+    result, frames = run_ffmpeg(argv, "render", cancel, None)
     if result.cancelled:
         raise ExportCancelledError("Експорт скасовано")
     return result.exit_code == 0 and frames == 0
@@ -550,10 +584,7 @@ def _render_argv(plan: _Plan, temp: Path, mode: SeekMode) -> list[str]:
     graph = _video_chain(plan)
     for position, audio_index in enumerate(plan.audio_indexes):
         # One chain per stream: first_pts=0 pads each stream's own late start with silence.
-        graph += (
-            f";[0:{audio_index}]atrim=start={plan.start_text}:end={plan.end_text},"
-            f"asetpts=PTS-{plan.start_text}/TB,aresample=async=1:first_pts=0[a{position}]"
-        )
+        graph += ";" + audio_chain(audio_index, position, plan.start_text, plan.end_text)
     argv = [
         str(plan.ffmpeg),
         "-hide_banner",
@@ -593,7 +624,7 @@ def _render_argv(plan: _Plan, temp: Path, mode: SeekMode) -> list[str]:
     return argv
 
 
-def _run_ffmpeg(
+def run_ffmpeg(
     argv: list[str],
     stage: ExportStage,
     cancel: threading.Event | None,
@@ -623,7 +654,7 @@ def _run_ffmpeg(
     return result, last_frame[0]
 
 
-def _render_failure(result: ProcessResult, output_dir: Path) -> ExportError:
+def render_failure(result: ProcessResult, output_dir: Path) -> ExportError:
     tail = result.stderr_tail[-2000:]
     if _NO_SPACE_TEXT in tail or _free_bytes(output_dir) < _DISK_FULL_FREE_BYTES:
         return DiskFullError("Недостатньо місця на диску для експорту", detail=tail)
@@ -648,7 +679,7 @@ def _verify(
     cancel: threading.Event | None,
     on_progress: ExportProgressCallback | None,
 ) -> _Observed:
-    _raise_if_cancelled(cancel)
+    raise_if_cancelled(cancel)
     info = _ffprobe_json(tools, ["-show_format", "-show_streams"], temp)
     streams = [_obj(item) for item in _list(info.get("streams"))]
     videos = [stream for stream in streams if stream.get("codec_type") == "video"]
@@ -759,7 +790,7 @@ def _decode_check(
         "null",
         "-",
     ]
-    result, frames = _run_ffmpeg(argv, "verify", cancel, on_progress)
+    result, frames = run_ffmpeg(argv, "verify", cancel, on_progress)
     if result.cancelled:
         raise ExportCancelledError("Експорт скасовано")
     tail = result.stderr_tail[-2000:]

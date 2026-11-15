@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from clipforge import __version__
-from clipforge.api import clips, exports, health, jobs, projects, sources
+from clipforge.api import clips, exports, health, jobs, previews, projects, sources, system
 from clipforge.api.errors import UnexpectedErrorMiddleware, install_error_handlers
 from clipforge.api.security import LocalAccessMiddleware, allowed_hosts
 from clipforge.config import Config
@@ -27,7 +27,7 @@ def create_app(config: Config, *, port: int, runtime: Runtime) -> FastAPI:
     )
     install_error_handlers(app)
     app.include_router(health.build_router(config), prefix="/v1")
-    for module in (projects, sources, clips, exports, jobs):
+    for module in (projects, sources, previews, clips, exports, jobs, system):
         app.include_router(module.build_router(runtime), prefix="/v1")
     app.add_middleware(
         LocalAccessMiddleware,

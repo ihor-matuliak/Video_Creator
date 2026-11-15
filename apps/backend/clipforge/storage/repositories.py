@@ -13,11 +13,12 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
 
-from sqlalchemy import CursorResult, Result, Select, and_, or_, select, text, update
+from sqlalchemy import CursorResult, Result, Select, and_, func, or_, select, text, update
 from sqlalchemy.orm import InstrumentedAttribute, Session
 
+from .database import CASEFOLD_FUNCTION
 from .errors import RecordNotFound, StaleRevision
-from .models import Clip, ExportBatch, ExportItem, Job, Project, Source
+from .models import Clip, ExportBatch, ExportItem, Job, Preview, Project, Source
 from .util import new_id, utc_now
 
 MAX_PAGE_SIZE: Final = 1000
@@ -81,6 +82,18 @@ def _rowcount(result: Result[Any]) -> int:
     return int(result.rowcount)
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectSummary:
+    """A project with the figures of the project list (docs/03 section 4)."""
+
+    project: Project
+    source_count: int
+    clip_count: int
+    # The latest of the project's own update and the creation or update of its sources, clips
+    # and export batches; same ISO 8601 UTC format as the stored timestamps.
+    last_activity_at: str
+
+
 class ProjectRepository:
     def __init__(self, session: Session, *, now: Clock = utc_now) -> None:
         self._session = session
@@ -100,14 +113,74 @@ class ProjectRepository:
         return self._session.get(Project, project_id)
 
     def list_page(
-        self, *, limit: int = 50, after: str | None = None, include_archived: bool = False
+        self,
+        *,
+        limit: int = 50,
+        after: str | None = None,
+        include_archived: bool = False,
+        query: str | None = None,
     ) -> Page[Project]:
+        """``query`` is trimmed; a project matches when its name contains it as a substring after
+        ``str.casefold`` on both sides. An empty ``query`` does not filter. ``after`` may be any
+        project, listed or not."""
         statement = select(Project)
         if not include_archived:
             statement = statement.where(Project.archived_at.is_(None))
+        needle = (query or "").strip().casefold()
+        if needle:
+            folded = func.instr(getattr(func, CASEFOLD_FUNCTION)(Project.name), needle)
+            statement = statement.where(folded > 0)
         return _page(
             self._session, statement, Project.created_at, Project.id, limit=limit, after=after
         )
+
+    def summarize(self, projects: Sequence[Project]) -> list[ProjectSummary]:
+        """Figures for ``projects`` in the same order: two aggregate queries, whatever the count.
+
+        A clip belongs to a project through its source. ``last_activity_at`` compares strings,
+        which is chronological because the timestamps have a fixed width (``util.utc_now``).
+        """
+        if not projects:
+            return []
+        ids = [project.id for project in projects]
+        stats: dict[str, tuple[int, int, list[str]]] = {}
+        in_sources = self._session.execute(
+            select(
+                Source.project_id,
+                func.count(func.distinct(Source.id)),
+                func.count(Clip.id),
+                func.max(Source.created_at),
+                func.max(Clip.updated_at),
+            )
+            .select_from(Source)
+            .outerjoin(Clip, Clip.source_id == Source.id)
+            .where(Source.project_id.in_(ids))
+            .group_by(Source.project_id)
+        )
+        for project_id, sources, clips, last_source, last_clip in in_sources:
+            stamps = [stamp for stamp in (last_source, last_clip) if stamp is not None]
+            stats[project_id] = (sources, clips, stamps)
+        in_batches = self._session.execute(
+            select(ExportBatch.project_id, func.max(ExportBatch.created_at))
+            .where(ExportBatch.project_id.in_(ids))
+            .group_by(ExportBatch.project_id)
+        )
+        last_batches = {project_id: stamp for project_id, stamp in in_batches}
+        summaries: list[ProjectSummary] = []
+        for project in projects:
+            sources, clips, stamps = stats.get(project.id, (0, 0, []))
+            latest = [project.updated_at, *stamps]
+            if project.id in last_batches:
+                latest.append(last_batches[project.id])
+            summaries.append(
+                ProjectSummary(
+                    project=project,
+                    source_count=sources,
+                    clip_count=clips,
+                    last_activity_at=max(latest),
+                )
+            )
+        return summaries
 
     def rename(self, project_id: str, name: str) -> Project:
         project = self._require(project_id)
@@ -197,6 +270,15 @@ class SourceRepository:
             .order_by(Source.created_at, Source.id)
         )
         return list(self._session.scalars(statement))
+
+    def list_page_for_project(
+        self, project_id: str, *, limit: int = 50, after: str | None = None
+    ) -> Page[Source]:
+        """Sources of one project in (created_at, id) order; ``after`` as in ``list_page``."""
+        statement = select(Source).where(Source.project_id == project_id)
+        return _page(
+            self._session, statement, Source.created_at, Source.id, limit=limit, after=after
+        )
 
     def list_by_hash_status(self, hash_status: str) -> list[Source]:
         statement = (
@@ -464,6 +546,115 @@ class ExportRepository:
             setattr(item, name, value)
         self._session.flush()
         return item
+
+
+class PreviewRepository:
+    """Preview proxies (ADR 021). The row says what a file in the preview cache is for; the
+    status vocabulary is ``models.PREVIEW_STATUSES`` and the state machine is the service's."""
+
+    def __init__(self, session: Session, *, now: Clock = utc_now) -> None:
+        self._session = session
+        self._now = now
+
+    def add(
+        self,
+        *,
+        source_id: str,
+        audio_stream_index: int | None,
+        profile_version: int,
+        job_id: str,
+        source_size: int,
+        source_mtime: int,
+    ) -> Preview:
+        """New ``queued`` preview. ``source_size`` and ``source_mtime`` (``st_mtime_ns``) are the
+        facts of the source the proxy is made from; they decide later whether it is still valid."""
+        now = self._now()
+        preview = Preview(
+            id=new_id(),
+            source_id=source_id,
+            audio_stream_index=audio_stream_index,
+            profile_version=profile_version,
+            job_id=job_id,
+            status="queued",
+            source_size=source_size,
+            source_mtime=source_mtime,
+            file_size=None,
+            error_code=None,
+            created_at=now,
+            updated_at=now,
+        )
+        self._session.add(preview)
+        self._session.flush()
+        return preview
+
+    def get(self, preview_id: str) -> Preview | None:
+        return self._session.get(Preview, preview_id)
+
+    def find_ready(
+        self, source_id: str, audio_stream_index: int | None, profile_version: int
+    ) -> Preview | None:
+        """The newest ``ready`` preview of the key ``(source, audio stream, profile version)``;
+        a ``NULL`` audio stream (no sound) is a key of its own."""
+        return self._newest(source_id, audio_stream_index, profile_version, ("ready",))
+
+    def find_open(
+        self, source_id: str, audio_stream_index: int | None, profile_version: int
+    ) -> Preview | None:
+        """The newest ``queued`` or ``running`` preview of the key."""
+        return self._newest(source_id, audio_stream_index, profile_version, ("queued", "running"))
+
+    def list_with_status(self, statuses: Collection[str]) -> list[Preview]:
+        statement = (
+            select(Preview)
+            .where(Preview.status.in_(tuple(statuses)))
+            .order_by(Preview.created_at, Preview.id)
+        )
+        return list(self._session.scalars(statement))
+
+    def set_state(
+        self,
+        preview_id: str,
+        status: str,
+        *,
+        file_size: int | None = None,
+        error_code: str | None = None,
+    ) -> Preview:
+        """Set the status together with ``file_size`` and ``error_code`` (both replaced, so a
+        state that has none clears them)."""
+        preview = self._session.get(Preview, preview_id)
+        if preview is None:
+            raise RecordNotFound("preview", preview_id)
+        preview.status = status
+        preview.file_size = file_size
+        preview.error_code = error_code
+        preview.updated_at = self._now()
+        self._session.flush()
+        return preview
+
+    def _newest(
+        self,
+        source_id: str,
+        audio_stream_index: int | None,
+        profile_version: int,
+        statuses: Collection[str],
+    ) -> Preview | None:
+        audio = (
+            Preview.audio_stream_index.is_(None)
+            if audio_stream_index is None
+            else Preview.audio_stream_index == audio_stream_index
+        )
+        statement = (
+            select(Preview)
+            .where(
+                Preview.source_id == source_id,
+                audio,
+                Preview.profile_version == profile_version,
+                Preview.status.in_(tuple(statuses)),
+            )
+            .order_by(Preview.created_at.desc(), Preview.id.desc())
+            .limit(1)
+        )
+        return self._session.scalars(statement).first()
 
 
 class JobRepository:

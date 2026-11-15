@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import time
 from pathlib import Path
@@ -13,6 +14,7 @@ from fastapi.testclient import TestClient
 from httpx2 import Response
 
 from clipforge.adapters.media_tools import MediaTools, run_short
+from clipforge.api.media import ByteRange, RangeNotSatisfiableError, parse_byte_range
 from clipforge.services.runtime import Runtime
 from clipforge.storage import SourceRepository
 
@@ -147,6 +149,36 @@ def test_source_without_audio_has_no_audio_streams(client: TestClient) -> None:
 
 def test_vfr_source_duration_comes_from_the_video_stream(client: TestClient) -> None:
     assert register_ok(client, fixture_file("vfr.mkv"))["duration_ms"] == 8966
+
+
+def test_probe_reports_frame_rate_and_vfr_flag(client: TestClient) -> None:
+    vfr = register_ok(client, fixture_file("vfr.mkv"))["probe"]
+    assert vfr["vfr"] is True
+    numerator, denominator = (int(part) for part in vfr["frame_rate"].split("/"))
+    assert 20.0 < numerator / denominator < 20.1  # 180 frames over about 9 s, not 30
+
+    for name in ("color_gop.mp4", "two_tracks.mkv"):
+        constant = register_ok(client, fixture_file(name))["probe"]
+        assert constant["vfr"] is False, name
+        assert constant["frame_rate"] == "30/1", name
+
+
+def test_probe_without_frame_timing_keys_is_served_as_stored(
+    client: TestClient, runtime: Runtime
+) -> None:
+    source = register_ok(client, fixture_file("color_gop.mp4"))
+    old_probe = {
+        key: value for key, value in source["probe"].items() if key not in ("frame_rate", "vfr")
+    }
+    with runtime.database.write_session() as session:
+        stored = SourceRepository(session).get(source["id"])
+        assert stored is not None
+        stored.probe_json = old_probe  # JSON columns are assigned whole, never mutated
+
+    response = client.get(f"/v1/sources/{source['id']}")
+    assert response.status_code == 200
+    assert response.json()["probe"] == old_probe
+    assert "vfr" not in response.json()["probe"]
 
 
 def test_unicode_and_space_in_file_name_work(client: TestClient) -> None:
@@ -322,6 +354,138 @@ def test_availability_follows_the_file(client: TestClient, tmp_path: Path) -> No
     assert client.get(url).json()["availability"] == "missing"
 
 
+# --- list ----------------------------------------------------------------------------------
+
+LIST_FIXTURES = ("color_gop.mp4", "no_audio.mp4", "two_tracks.mkv")
+
+
+def register_three(client: TestClient, project_id: str, directory: Path) -> list[dict[str, Any]]:
+    """Register three files and wait for their SHA-256 jobs, so later reads are stable."""
+    sources: list[dict[str, Any]] = []
+    for name in LIST_FIXTURES:
+        response = register(client, project_id, copy_fixture(name, directory))
+        assert response.status_code == 201, response.text
+        sources.append(response.json())
+    for source in sources:
+        assert wait_job(client, source["hash_job_id"])["state"] == "succeeded"
+    return sources
+
+
+def list_sources(client: TestClient, project_id: str, **params: str) -> Response:
+    return client.get("/v1/sources", params={"project_id": project_id, **params})
+
+
+def test_list_is_in_creation_order_and_items_equal_get(client: TestClient, tmp_path: Path) -> None:
+    project_id = new_project(client)
+    registered = register_three(client, project_id, tmp_path)
+
+    response = list_sources(client, project_id)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["next_cursor"] is None
+    items = body["items"]
+    # The clock is coarse, so sources registered in one tick are ordered by id.
+    keys = [(item["created_at"], item["id"]) for item in items]
+    assert keys == sorted(keys)
+    assert {item["id"] for item in items} == {source["id"] for source in registered}
+    for item in items:
+        assert item == client.get(f"/v1/sources/{item['id']}").json()
+        assert item["hash_job_id"] is None
+
+
+def test_list_pages_with_a_cursor_cover_every_source_once(
+    client: TestClient, tmp_path: Path
+) -> None:
+    project_id = new_project(client)
+    registered = register_three(client, project_id, tmp_path)
+    everything = [item["id"] for item in list_sources(client, project_id).json()["items"]]
+
+    first = list_sources(client, project_id, limit="2").json()
+    assert len(first["items"]) == 2
+    assert first["next_cursor"] == first["items"][-1]["id"]
+    second = list_sources(client, project_id, limit="2", cursor=first["next_cursor"]).json()
+    assert len(second["items"]) == 1
+    assert second["next_cursor"] is None
+
+    seen = [item["id"] for item in first["items"] + second["items"]]
+    assert seen == everything
+    assert len(set(seen)) == 3
+    assert set(seen) == {source["id"] for source in registered}
+
+
+def test_list_never_shows_sources_of_other_projects(client: TestClient, tmp_path: Path) -> None:
+    mine, other = new_project(client, "Мій"), new_project(client, "Чужий")
+    own = register_three(client, mine, tmp_path / "mine")
+    foreign = register_three(client, other, tmp_path / "other")
+
+    for project_id, expected in ((mine, own), (other, foreign)):
+        items = list_sources(client, project_id).json()["items"]
+        assert {item["id"] for item in items} == {source["id"] for source in expected}
+        assert {item["project_id"] for item in items} == {project_id}
+    # A cursor taken from another project never lets its sources in.
+    cursor = foreign[0]["id"]
+    leaked = list_sources(client, mine, cursor=cursor).json()["items"]
+    assert {item["project_id"] for item in leaked} <= {mine}
+
+
+def test_list_of_a_project_without_sources_is_empty(client: TestClient) -> None:
+    response = list_sources(client, new_project(client))
+    assert response.status_code == 200
+    assert response.json() == {"items": [], "next_cursor": None}
+
+
+def test_list_of_an_unknown_project_is_404(client: TestClient) -> None:
+    response = list_sources(client, "no-such-project")
+    assert response.status_code == 404
+    assert error_of(response)["code"] == "PROJECT_NOT_FOUND"
+
+
+def test_list_needs_a_project_id(client: TestClient) -> None:
+    for params in ({}, {"project_id": ""}):
+        response = client.get("/v1/sources", params=params)
+        assert response.status_code == 422
+        assert error_of(response)["code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.parametrize("limit", ["0", "-1", "101", "abc"])
+def test_list_bad_limit_is_422(client: TestClient, limit: str) -> None:
+    response = list_sources(client, new_project(client), limit=limit)
+    assert response.status_code == 422
+    assert error_of(response)["code"] == "VALIDATION_ERROR"
+
+
+def test_list_accepts_limits_from_1_to_100(client: TestClient) -> None:
+    project_id = new_project(client)
+    for limit in ("1", "100"):
+        assert list_sources(client, project_id, limit=limit).status_code == 200
+
+
+def test_list_garbage_cursor_is_422(client: TestClient, tmp_path: Path) -> None:
+    project_id = new_project(client)
+    register_three(client, project_id, tmp_path)
+    response = list_sources(client, project_id, cursor="garbage-cursor")
+    assert response.status_code == 422
+    assert error_of(response)["code"] == "INVALID_CURSOR"
+    assert "garbage-cursor" not in response.text
+
+
+def test_list_availability_follows_the_file(client: TestClient, tmp_path: Path) -> None:
+    project_id = new_project(client)
+    source = register(client, project_id, copy_fixture("color_gop.mp4", tmp_path)).json()
+    wait_job(client, source["hash_job_id"])
+    path = Path(source["path"])
+    assert list_sources(client, project_id).json()["items"][0]["availability"] == "available"
+
+    with path.open("ab") as handle:
+        handle.write(b"x")
+    assert list_sources(client, project_id).json()["items"][0]["availability"] == "changed"
+
+    path.unlink()
+    item = list_sources(client, project_id).json()["items"][0]
+    assert item["availability"] == "missing"
+    assert item == client.get(f"/v1/sources/{source['id']}").json()
+
+
 # --- relink --------------------------------------------------------------------------------
 
 
@@ -417,3 +581,270 @@ def test_relink_needs_a_computed_hash(client: TestClient, runtime: Runtime, tmp_
     assert response.status_code == 409
     assert error_of(response)["code"] == "SOURCE_HASH_UNAVAILABLE"
     assert error_of(response)["retryable"] is False
+
+
+# --- media (Range) -------------------------------------------------------------------------
+
+
+def media_source(client: TestClient, tmp_path: Path, name: str = "color_gop.mp4") -> Any:
+    """``(url, path, bytes)`` of a registered private copy of a fixture."""
+    path = copy_fixture(name, tmp_path / "media")
+    source = register_ok(client, path)
+    return f"/v1/sources/{source['id']}/media", path, path.read_bytes()
+
+
+def test_media_without_range_is_the_whole_file(client: TestClient, tmp_path: Path) -> None:
+    url, _, data = media_source(client, tmp_path)
+    response = client.get(url)
+    assert response.status_code == 200
+    assert response.content == data
+    assert response.headers["content-length"] == str(len(data))
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.headers["content-type"] == "video/mp4"
+    assert "content-range" not in response.headers
+
+
+def test_media_larger_than_one_chunk_is_streamed_whole(client: TestClient, tmp_path: Path) -> None:
+    url, _, data = media_source(client, tmp_path, "two_tracks.mkv")
+    assert len(data) > 2 * 1024 * 1024
+    response = client.get(url)
+    assert response.status_code == 200
+    assert response.content == data
+    assert response.headers["content-type"] == "video/x-matroska"
+
+    start = 1024 * 1024 - 5
+    response = client.get(url, headers={"Range": f"bytes={start}-{start + 9}"})
+    assert response.status_code == 206
+    assert response.content == data[start : start + 10]
+
+
+def test_media_small_chunks_cover_the_exact_range(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("clipforge.api.media.CHUNK_SIZE", 1000)
+    url, _, data = media_source(client, tmp_path)
+    assert client.get(url).content == data
+    response = client.get(url, headers={"Range": "bytes=1234-5678"})
+    assert response.content == data[1234:5679]
+
+
+def test_media_explicit_range_is_206_with_exact_bytes(client: TestClient, tmp_path: Path) -> None:
+    url, _, data = media_source(client, tmp_path)
+    response = client.get(url, headers={"Range": "bytes=0-99"})
+    assert response.status_code == 206
+    assert response.content == data[:100]
+    assert response.headers["content-range"] == f"bytes 0-99/{len(data)}"
+    assert response.headers["content-length"] == "100"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.headers["content-type"] == "video/mp4"
+
+    response = client.get(url, headers={"Range": "bytes=100-100"})
+    assert response.status_code == 206
+    assert response.content == data[100:101]
+
+
+def test_media_suffix_range_returns_the_tail(client: TestClient, tmp_path: Path) -> None:
+    url, _, data = media_source(client, tmp_path)
+    response = client.get(url, headers={"Range": "bytes=-100"})
+    assert response.status_code == 206
+    assert response.content == data[-100:]
+    tail_start = len(data) - 100
+    assert response.headers["content-range"] == f"bytes {tail_start}-{len(data) - 1}/{len(data)}"
+    assert response.headers["content-length"] == "100"
+
+    # A suffix longer than the file is the whole file.
+    response = client.get(url, headers={"Range": f"bytes=-{len(data) + 1000}"})
+    assert response.status_code == 206
+    assert response.content == data
+    assert response.headers["content-range"] == f"bytes 0-{len(data) - 1}/{len(data)}"
+
+
+def test_media_open_ended_range_runs_to_the_end(client: TestClient, tmp_path: Path) -> None:
+    url, _, data = media_source(client, tmp_path)
+    response = client.get(url, headers={"Range": "bytes=1000-"})
+    assert response.status_code == 206
+    assert response.content == data[1000:]
+    assert response.headers["content-range"] == f"bytes 1000-{len(data) - 1}/{len(data)}"
+
+    last = len(data) - 1
+    response = client.get(url, headers={"Range": f"bytes={last}-"})
+    assert response.status_code == 206
+    assert response.content == data[last:]
+
+
+def test_media_range_end_past_the_file_is_clamped(client: TestClient, tmp_path: Path) -> None:
+    url, _, data = media_source(client, tmp_path)
+    for end in (len(data), len(data) + 12345, "9" * 40):
+        response = client.get(url, headers={"Range": f"bytes=10-{end}"})
+        assert response.status_code == 206, end
+        assert response.content == data[10:]
+        assert response.headers["content-range"] == f"bytes 10-{len(data) - 1}/{len(data)}"
+
+
+def test_media_range_unit_is_case_insensitive(client: TestClient, tmp_path: Path) -> None:
+    url, _, data = media_source(client, tmp_path)
+    response = client.get(url, headers={"Range": "Bytes=0-9"})
+    assert response.status_code == 206
+    assert response.content == data[:10]
+
+
+def test_media_start_at_or_past_the_end_is_416(client: TestClient, tmp_path: Path) -> None:
+    url, path, data = media_source(client, tmp_path)
+    for header in (f"bytes={len(data)}-", f"bytes={len(data)}-{len(data) + 5}", "bytes=999999999-"):
+        response = client.get(url, headers={"Range": header})
+        assert response.status_code == 416, header
+        assert response.headers["content-range"] == f"bytes */{len(data)}"
+        assert response.headers["accept-ranges"] == "bytes"
+        error = error_of(response)
+        assert error["code"] == "RANGE_NOT_SATISFIABLE"
+        assert error["retryable"] is False
+        assert str(path) not in response.text
+        assert path.name not in response.text
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "bytes=0-9,20-29",
+        "bytes=0-9, 20-29",
+        "bytes=-5,-10",
+        "bytes=",
+        "bytes=-",
+        "bytes=abc",
+        "bytes=a-b",
+        "bytes=5-2",
+        "bytes=-0",
+        "bytes=--5",
+        "bytes=0--5",
+        "items=0-9",
+        "0-9",
+        "",
+    ],
+)
+def test_media_multi_range_and_malformed_range_are_416(
+    client: TestClient, tmp_path: Path, header: str
+) -> None:
+    url, _, data = media_source(client, tmp_path)
+    response = client.get(url, headers={"Range": header})
+    assert response.status_code == 416
+    assert response.headers["content-range"] == f"bytes */{len(data)}"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert error_of(response)["code"] == "RANGE_NOT_SATISFIABLE"
+
+
+@pytest.mark.parametrize(
+    ("name", "content_type"),
+    [
+        ("clip.MP4", "video/mp4"),
+        ("clip.mov", "video/quicktime"),
+        ("clip.ts", "video/mp2t"),
+        ("clip.dat", "application/octet-stream"),
+        ("clip", "application/octet-stream"),
+    ],
+)
+def test_media_content_type_follows_the_extension(
+    client: TestClient, tmp_path: Path, name: str, content_type: str
+) -> None:
+    path = copy_fixture("color_gop.mp4", tmp_path / "media", name)
+    source = register_ok(client, path)
+    response = client.get(f"/v1/sources/{source['id']}/media")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == content_type
+    assert response.content == path.read_bytes()
+
+
+def test_media_unknown_source_is_404(client: TestClient) -> None:
+    response = client.get("/v1/sources/nope/media")
+    assert response.status_code == 404
+    assert error_of(response)["code"] == "SOURCE_NOT_FOUND"
+    # The id is checked before the Range header.
+    assert client.get("/v1/sources/nope/media", headers={"Range": "bytes=0-9"}).status_code == 404
+
+
+def test_media_needs_the_session_token(anonymous: TestClient) -> None:
+    assert anonymous.get("/v1/sources/nope/media").status_code == 401
+
+
+def test_byte_range_parser_accepts_only_ascii_digits() -> None:
+    assert parse_byte_range("bytes=0-9", 100) == ByteRange(0, 9)
+    assert parse_byte_range(" bytes=95- ", 100) == ByteRange(95, 99)
+    assert parse_byte_range("bytes=-10", 100) == ByteRange(90, 99)
+    for header in ("bytes=١-٩", "bytes=0-9x", "bytes=-5-"):
+        with pytest.raises(RangeNotSatisfiableError):
+            parse_byte_range(header, 100)
+    with pytest.raises(RangeNotSatisfiableError):
+        parse_byte_range("bytes=0-0", 0)
+    with pytest.raises(RangeNotSatisfiableError):
+        parse_byte_range("bytes=-5", 0)
+
+
+def test_media_of_a_deleted_file_is_source_unavailable(client: TestClient, tmp_path: Path) -> None:
+    url, path, _ = media_source(client, tmp_path)
+    path.unlink()
+    for headers in ({}, {"Range": "bytes=0-9"}):
+        response = client.get(url, headers=headers)
+        assert response.status_code == 400
+        error = error_of(response)
+        assert error["code"] == "SOURCE_UNAVAILABLE"
+        assert error["details"] == {}
+        assert str(path) not in response.text
+        assert path.name not in response.text
+        assert str(tmp_path) not in response.text
+
+
+def test_media_of_a_changed_file_is_source_changed(client: TestClient, tmp_path: Path) -> None:
+    url, path, _ = media_source(client, tmp_path)
+    original = path.stat()
+
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns + 5_000_000_000))
+    response = client.get(url)
+    assert response.status_code == 400
+    assert error_of(response)["code"] == "SOURCE_CHANGED"
+    assert str(path) not in response.text
+
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+    assert client.get(url).status_code == 200
+
+    with path.open("ab") as handle:
+        handle.write(b"x")
+    response = client.get(url, headers={"Range": "bytes=0-9"})
+    assert response.status_code == 400
+    assert error_of(response)["code"] == "SOURCE_CHANGED"
+
+
+def test_media_of_a_directory_at_the_stored_path_is_source_unavailable(
+    client: TestClient, tmp_path: Path
+) -> None:
+    url, path, _ = media_source(client, tmp_path)
+    path.unlink()
+    path.mkdir()
+    response = client.get(url)
+    assert response.status_code == 400
+    assert error_of(response)["code"] == "SOURCE_UNAVAILABLE"
+
+
+def test_media_reads_leave_the_original_untouched(client: TestClient, tmp_path: Path) -> None:
+    url, path, data = media_source(client, tmp_path)
+    before = (sha256(path), path.stat().st_mtime_ns, path.stat().st_size)
+
+    for header in (None, "bytes=0-99", "bytes=-100", "bytes=50-", "bytes=0-9,20-29", "bytes=-0"):
+        client.get(url, headers={} if header is None else {"Range": header})
+    assert client.get(url).content == data
+
+    assert (sha256(path), path.stat().st_mtime_ns, path.stat().st_size) == before
+    # Nothing was left open: the file can be replaced right away (Windows would refuse otherwise).
+    path.unlink()
+    path.write_bytes(data)
+    os.utime(path, ns=(path.stat().st_atime_ns, before[1]))
+    assert client.get(url).content == data
+
+
+def test_media_has_no_path_parameter_and_ignores_extra_input(
+    client: TestClient, tmp_path: Path
+) -> None:
+    url, _, data = media_source(client, tmp_path)
+    other = copy_fixture("no_audio.mp4", tmp_path / "other")
+    response = client.get(url, params={"path": str(other)})
+    assert response.status_code == 200
+    assert response.content == data
+    assert client.get("/v1/sources/..%2F..%2Fetc/media").status_code == 404

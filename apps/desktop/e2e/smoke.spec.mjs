@@ -81,7 +81,18 @@ test('Electron starts the sidecar, shows live test status and ends it on quit', 
         hasNode: typeof globalThis.require !== 'undefined' || typeof globalThis.process !== 'undefined',
       };
     });
-    expect(surface.keys).toEqual(['bridgeVersion', 'getStatus']);
+    expect(surface.keys).toEqual([
+      'bridgeVersion',
+      'call',
+      'chooseExportFolder',
+      'getStatus',
+      'getViewState',
+      'importVideo',
+      'openExportFolder',
+      'pickVideo',
+      'setViewState',
+      'takeDroppedVideo',
+    ]);
     expect(surface.statusKeys).toEqual(['mode', 'state', 'version']);
     expect(surface.status).toMatchObject({ state: 'ready', mode: 'test' });
     expect(surface.serialized).not.toMatch(/token|fetch/i);

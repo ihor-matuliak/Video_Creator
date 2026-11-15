@@ -54,7 +54,8 @@ HTTP 400 — некоректна доменна дія; 401 — token; 404 — 
 |---|---|---|
 | GET /v1/health | немає | {status:"ok",mode:"test" або "production",version} |
 | POST /v1/projects | {name} | 201 {id,name} |
-| GET /v1/projects | limit,cursor | {items,next_cursor} |
+| GET /v1/projects | limit,cursor,include_archived,q | {items,next_cursor} |
+| PATCH /v1/projects/{id} | {name?,archived?} | 200 project (ADR 020) |
 | POST /v1/sources | {project_id,path} | 201 source з id,duration_ms,audio_streams |
 | GET /v1/sources/{id} | немає | source metadata |
 | POST /v1/sources/{id}/relink | {path} | source або SOURCE_MISMATCH |
@@ -78,6 +79,8 @@ HTTP 400 — некоректна доменна дія; 401 — token; 404 — 
 | POST /v1/runtime/credentials | {openrouter_api_key} main-only | 204; in-memory sidecar secret |
 | POST /v1/cache/preview-cleanup | {project_id} | {files,count,bytes} app-owned only |
 | POST /v1/cache/cleanup | {preview_id} | job; перевірити preview freshness |
+
+Додано в M2 (2026-11-14): GET /v1/sources (project_id,limit,cursor → {items,next_cursor}; ADR 023); POST /v1/sources/{id}/previews (202), GET /v1/previews/{id}, GET /v1/previews/{id}/media (Range, 200/206/416) — preview-proxy, ADR 021. GET /v1/projects (Т18): параметр `q` (пошук підрядка в назві без урахування регістру, Unicode) і поля кожного item `source_count`, `clip_count`, `last_activity_at` — адитивно, ADR 023; `q` довший за 200 символів → 422. POST/GET /v1/sources (Т12a): `probe.frame_rate` (дріб "num/den") і `probe.vfr` (true/false/null — невідомо), ADR 023. GET /v1/system/checks (Т17) → {ffmpeg:{ok,version}, ffprobe:{ok,version}, data_dir:{ok,free_bytes}} — без шляхів; ADR 023.
 
 API шлях із {id} означає параметр маршруту, не текст для вставляння в команду. У тестах створені IDs беруться з response.
 

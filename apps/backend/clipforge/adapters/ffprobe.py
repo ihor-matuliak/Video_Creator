@@ -4,12 +4,15 @@ Canonical zero is the presentation time of the first decoded frame of the main v
 stream. It is kept exactly as ``origin_pts`` in the video stream time base;
 ``duration_ms`` and audio start offsets are measured from it.
 
-Three short ffprobe calls, each with a timeout:
+Short ffprobe calls, each with a timeout:
 
 1. ``-show_format -show_streams``: container and stream metadata;
 2. decode of the first packets of the video stream: the decode check and the origin;
 3. only when the container gives no video stream duration (Matroska): the packets
-   after the last keyframe, whose end is the end of the video stream.
+   after the last keyframe, whose end is the end of the video stream;
+4. the presentation timestamps of all video packets: frame rate and the VFR flag
+   (``analyze_frame_timing``). Best effort: with a shorter timeout, and a failure or a
+   timeout leaves both values unknown instead of failing the probe.
 
 The source is passed as one ``file:`` argument, so a file name is never parsed as an
 option or as another FFmpeg protocol. The file is only read.
@@ -24,12 +27,15 @@ import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 from fractions import Fraction
+from itertools import pairwise
 from pathlib import Path
 from typing import ClassVar, Final
 
 from clipforge.adapters.media_tools import MediaToolsUnavailableError, run_short, stderr_tail
 
 DEFAULT_TIMEOUT_S: Final = 60.0
+FRAME_SCAN_TIMEOUT_S: Final = 20.0
+"""Upper bound of the whole-stream timestamp scan; the HTTP request that probes waits for it."""
 DECODE_CHECK_PACKETS: Final = 60
 HDR_UNSUPPORTED: Final = "HDR_UNSUPPORTED"
 _HDR_TRANSFERS: Final = frozenset({"smpte2084", "arib-std-b67"})
@@ -108,6 +114,15 @@ class SourceProbe:
     unsupported_reason: str | None
     """``HDR_UNSUPPORTED`` for HDR sources (docs/05 section 2), otherwise ``None``."""
     audio_streams: tuple[AudioStream, ...]
+    frame_rate: Fraction | None = None
+    """Average frames per second of the main video stream, ``None`` when unknown.
+
+    Measured from the packet timestamps when they were scanned (see
+    ``analyze_frame_timing``); otherwise the container's ``avg_frame_rate``, which is an
+    estimate for Matroska and unverified while ``vfr`` is ``None``.
+    """
+    vfr: bool | None = None
+    """``True`` for variable frame rate, ``False`` for constant, ``None`` when not determined."""
 
     @property
     def origin_seconds(self) -> Fraction:
@@ -149,6 +164,10 @@ def probe_source(
     if duration_ms <= 0:
         raise SourceUnreadableError("Не вдалося визначити тривалість відео")
 
+    frame_rate, vfr = _frame_timing(
+        ffprobe, source, video, video_index, time_base, min(timeout_s, FRAME_SCAN_TIMEOUT_S)
+    )
+
     hdr = _is_hdr(video)
     return SourceProbe(
         format_name=_str(container.get("format_name")) or "",
@@ -167,6 +186,8 @@ def probe_source(
             for audio in (_audio_stream(stream, origin) for stream in streams)
             if audio is not None
         ),
+        frame_rate=frame_rate,
+        vfr=vfr,
     )
 
 
@@ -184,9 +205,10 @@ def _check_readable_file(source: Path) -> None:
         raise SourceUnavailableError("Немає доступу до файлу джерела") from None
 
 
-def _run_json(
-    ffprobe: Path, options: Sequence[str], source: Path, timeout_s: float
-) -> dict[str, object]:
+def _run_ffprobe(
+    ffprobe: Path, options: Sequence[str], output_format: str, source: Path, timeout_s: float
+) -> tuple[bytes, str]:
+    """Run one ffprobe call; returns its stdout and the stderr tail."""
     argv = [
         str(ffprobe),
         "-v",
@@ -194,7 +216,7 @@ def _run_json(
         "-hide_banner",
         *options,
         "-of",
-        "json",
+        output_format,
         "-i",
         f"file:{source}",
     ]
@@ -209,8 +231,15 @@ def _run_json(
         raise SourceUnreadableError(
             "Файл пошкоджений або має непідтримуваний формат", detail=detail
         )
+    return completed.stdout, detail
+
+
+def _run_json(
+    ffprobe: Path, options: Sequence[str], source: Path, timeout_s: float
+) -> dict[str, object]:
+    stdout, detail = _run_ffprobe(ffprobe, options, "json", source, timeout_s)
     try:
-        document: object = json.loads(completed.stdout.decode("utf-8", errors="replace"))
+        document: object = json.loads(stdout.decode("utf-8", errors="replace"))
     except ValueError:
         document = None
     if not isinstance(document, dict):
@@ -285,6 +314,92 @@ def _video_end_pts(
     if not ends:
         raise SourceUnreadableError("Не вдалося визначити тривалість відео")
     return max(ends)
+
+
+def _frame_timing(
+    ffprobe: Path,
+    source: Path,
+    video: dict[str, object],
+    video_index: int,
+    time_base: Fraction,
+    timeout_s: float,
+) -> tuple[Fraction | None, bool | None]:
+    """Frame rate and VFR flag of the main video stream; unknown values are ``None``.
+
+    The scan is best effort: when it fails or exceeds ``timeout_s``, the probe still
+    succeeds with ``vfr`` unknown and the container's ``avg_frame_rate`` as the rate.
+    """
+    reported = _positive_fraction(video.get("avg_frame_rate"))
+    try:
+        pts = _video_packet_pts(ffprobe, source, video_index, timeout_s)
+    except ProbeError:
+        return reported, None
+    return analyze_frame_timing(pts, time_base, reported)
+
+
+def _video_packet_pts(ffprobe: Path, source: Path, video_index: int, timeout_s: float) -> list[int]:
+    """Presentation timestamps of every video packet, in the video stream time base.
+
+    Reads the demuxed packets, without decoding. The compact one-line-per-packet output
+    keeps the result small for long sources. Discarded packets and packets without a
+    timestamp are left out.
+    """
+    options = ["-select_streams", str(video_index), "-show_entries", "packet=pts,flags"]
+    stdout, _ = _run_ffprobe(ffprobe, options, "compact=p=0", source, timeout_s)
+    timestamps: list[int] = []
+    for line in stdout.decode("utf-8", errors="replace").splitlines():
+        fields: dict[str, str] = {}
+        for part in line.split("|"):
+            key, _, value = part.partition("=")
+            fields[key] = value
+        pts = _int(fields.get("pts"))
+        if pts is not None and "D" not in fields.get("flags", ""):
+            timestamps.append(pts)
+    return timestamps
+
+
+def analyze_frame_timing(
+    pts: Sequence[int], time_base: Fraction, reported_rate: Fraction | None = None
+) -> tuple[Fraction | None, bool | None]:
+    """Average frame rate and the VFR flag from video presentation timestamps.
+
+    Container fields cannot decide this: for Matroska ``avg_frame_rate`` and
+    ``r_frame_rate`` are guesses from the first frames, both ``30/1`` for a stream that
+    later drops to 15 fps (the ``vfr.mkv`` fixture). So the timestamps themselves, in
+    ``time_base`` ticks, are analysed:
+
+    1. They are sorted and made distinct, because packets come in decode order and
+       B-frames reorder them. The intervals between neighbours are what is compared.
+    2. The stream is constant frame rate (``vfr`` is ``False``) when its longest and
+       shortest interval differ by at most one tick. Timestamps are integers, so a
+       constant period that is not a whole number of ticks (33.3 ms on a millisecond
+       time base) alternates between two neighbouring values, e.g. 33 and 34. A larger
+       difference, such as a dropped frame or a change of rate, makes it ``True``.
+    3. The frame rate is the number of intervals divided by the time from the first to
+       the last frame, an exact fraction. For constant rate, ``reported_rate`` (ffprobe's
+       ``avg_frame_rate``, e.g. ``30000/1001``) replaces it when it reproduces the last
+       timestamp within one tick, because the measured value is only as exact as the ticks.
+
+    Fewer than two distinct timestamps decide nothing: ``vfr`` is ``None`` and
+    ``reported_rate`` is returned unchanged.
+    """
+    times = sorted(set(pts))
+    if len(times) < 2:
+        return reported_rate, None
+    intervals = len(times) - 1
+    span = times[-1] - times[0]
+    shortest = longest = times[1] - times[0]
+    for previous, current in pairwise(times):
+        shortest = min(shortest, current - previous)
+        longest = max(longest, current - previous)
+    vfr = longest - shortest > 1
+
+    if not vfr and reported_rate is not None:
+        predicted_span = Fraction(intervals) / (reported_rate * time_base)
+        if abs(predicted_span - span) <= 1:
+            return reported_rate, vfr
+    measured = Fraction(intervals) / (span * time_base)
+    return measured, vfr
 
 
 def _audio_stream(stream: dict[str, object], origin: Fraction) -> AudioStream | None:

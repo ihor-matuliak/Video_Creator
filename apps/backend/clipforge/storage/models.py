@@ -36,6 +36,7 @@ JOB_STATES = (
     "cancelled",
     "interrupted",
 )
+PREVIEW_STATUSES = ("queued", "running", "ready", "failed", "cancelled", "interrupted")
 
 
 def _in(column: str, values: tuple[str, ...]) -> str:
@@ -161,6 +162,40 @@ class ExportItem(Base):
     final_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     observed_json: Mapped[dict[str, Any] | None] = mapped_column(VersionedJson, nullable=True)
     error_code: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class Preview(Base):
+    """A preview proxy of a source (ADR 021); its file is ``<data_dir>/cache/previews/<id>.mp4``."""
+
+    __tablename__ = "previews"
+    __table_args__ = (
+        CheckConstraint(
+            "audio_stream_index IS NULL OR audio_stream_index >= 0",
+            name="ck_previews_audio_stream_index",
+        ),
+        CheckConstraint("profile_version >= 1", name="ck_previews_profile_version"),
+        CheckConstraint("source_size >= 0", name="ck_previews_source_size"),
+        CheckConstraint("file_size IS NULL OR file_size >= 0", name="ck_previews_file_size"),
+        CheckConstraint(_in("status", PREVIEW_STATUSES), name="ck_previews_status"),
+        Index("ix_previews_source_id", "source_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    source_id: Mapped[str] = mapped_column(ForeignKey("sources.id"), nullable=False)
+    # Global source stream index of the kept audio; NULL is a proxy without sound.
+    audio_stream_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Version of the render recipe: a preview of another version is never reused.
+    profile_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    # Size and st_mtime_ns of the source this proxy was made from.
+    source_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_mtime: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Size of the verified file; set when the preview is ready.
+    file_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+    updated_at: Mapped[str] = mapped_column(String, nullable=False)
 
 
 class Job(Base):

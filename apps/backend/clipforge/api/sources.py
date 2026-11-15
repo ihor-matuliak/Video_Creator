@@ -1,14 +1,21 @@
-"""POST /v1/sources, GET /v1/sources/{id}, POST /v1/sources/{id}/relink."""
+"""POST/GET /v1/sources, GET /v1/sources/{id}, POST /v1/sources/{id}/relink, GET .../media."""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Header, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict
 
+from clipforge.api.media import media_response
+from clipforge.api.pagination import DEFAULT_PAGE_SIZE, Cursor
 from clipforge.services.runtime import Runtime
 from clipforge.storage import Source
+
+SOURCE_MAX_PAGE_SIZE = 100
+SourceLimit = Annotated[int, Query(ge=1, le=SOURCE_MAX_PAGE_SIZE)]
+ProjectId = Annotated[str, Query(min_length=1, max_length=200)]
 
 
 class SourceCreate(BaseModel):
@@ -56,6 +63,11 @@ class SourceOut(BaseModel):
     """The SHA-256 job queued by this registration; ``null`` in every other response."""
 
 
+class SourcePage(BaseModel):
+    items: list[SourceOut]
+    next_cursor: str | None
+
+
 def source_out(source: Source, *, hash_job_id: str | None = None) -> SourceOut:
     return SourceOut(
         id=source.id,
@@ -87,6 +99,17 @@ def build_router(runtime: Runtime) -> APIRouter:
         registered = runtime.sources.register(body.project_id, body.path)
         return source_out(registered.source, hash_job_id=registered.hash_job_id)
 
+    @router.get("/sources", response_model=SourcePage)
+    def list_sources(
+        project_id: ProjectId,
+        limit: SourceLimit = DEFAULT_PAGE_SIZE,
+        cursor: Cursor = None,
+    ) -> SourcePage:
+        page = runtime.sources.list_page(project_id, limit=limit, cursor=cursor)
+        return SourcePage(
+            items=[source_out(source) for source in page.items], next_cursor=page.next_cursor
+        )
+
     @router.get("/sources/{source_id}", response_model=SourceOut)
     def get_source(source_id: str) -> SourceOut:
         return source_out(runtime.sources.get(source_id))
@@ -94,5 +117,12 @@ def build_router(runtime: Runtime) -> APIRouter:
     @router.post("/sources/{source_id}/relink", response_model=SourceOut)
     def relink_source(source_id: str, body: SourceRelink) -> SourceOut:
         return source_out(runtime.sources.relink(source_id, body.path))
+
+    # Plain `def`: opening the file and reading chunks block, so they run in the thread pool.
+    @router.get("/sources/{source_id}/media")
+    def get_source_media(
+        source_id: str, range_header: Annotated[str | None, Header(alias="Range")] = None
+    ) -> Response:
+        return media_response(runtime.sources.open_media(source_id), range_header)
 
     return router

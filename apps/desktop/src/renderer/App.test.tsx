@@ -1,23 +1,15 @@
-import { render, screen } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, within } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { AppStatus, ClipforgeBridge } from '../shared/bridge';
 import { App } from './App';
+import { READY, installBridge, listOf } from './test-bridge';
 
-const READY: AppStatus = { state: 'ready', mode: 'production', version: '0.1.0' };
-
-function installBridge(getStatus: ClipforgeBridge['getStatus']): void {
-  const bridge: ClipforgeBridge = { bridgeVersion: 1, getStatus };
-  Object.defineProperty(window, 'clipforge', { value: bridge, configurable: true });
-}
+const NO_PROJECTS = { 'projects.list': listOf() };
 
 function installStatus(status: AppStatus): void {
-  installBridge(() => Promise.resolve(status));
+  installBridge({ getStatus: () => Promise.resolve(status), handlers: NO_PROJECTS });
 }
-
-afterEach(() => {
-  Reflect.deleteProperty(window, 'clipforge');
-});
 
 describe('App shell when the backend is ready', () => {
   it('shows the ClipForge Local title and the ready marker', async () => {
@@ -28,42 +20,52 @@ describe('App shell when the backend is ready', () => {
     expect(screen.getByRole('heading', { level: 1, name: 'ClipForge Local' })).toBeInTheDocument();
   });
 
-  it('shows the Ukrainian first-run heading', async () => {
-    installStatus(READY);
-    render(<App />);
-
-    expect(
-      await screen.findByRole('heading', {
-        level: 2,
-        name: 'Знайдімо цікаві моменти у твоєму відео',
-      }),
-    ).toBeInTheDocument();
-  });
-
   it('lists the sidebar sections with Projects as the current page', async () => {
     installStatus(READY);
     render(<App />);
 
-    expect(
-      await screen.findByRole('navigation', { name: 'Основна навігація' }),
-    ).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Проєкти' })).toHaveAttribute('aria-current', 'page');
-    expect(screen.getByRole('button', { name: 'Черга' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Налаштування' })).toBeDisabled();
+    const nav = await screen.findByRole('navigation', { name: 'Основна навігація' });
+    expect(within(nav).getByRole('button', { name: 'Проєкти' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+    expect(within(nav).getByRole('button', { name: 'Черга' })).toBeDisabled();
+    expect(within(nav).getByRole('button', { name: 'Налаштування' })).toBeDisabled();
   });
 
-  it('keeps unwired actions disabled with a visible explanation', async () => {
+  it('explains why Queue and Settings are unavailable, next to the buttons', async () => {
     installStatus(READY);
     render(<App />);
-    await screen.findByTestId('app-ready');
+    const nav = await screen.findByRole('navigation', { name: 'Основна навігація' });
 
-    for (const name of ['Додати відео', 'Налаштувати AI']) {
-      const button = screen.getByRole('button', { name });
-      expect(button).toBeDisabled();
-      expect(button).toHaveAccessibleDescription(
-        'Дії стануть доступні після підключення локального рушія.',
+    for (const name of ['Черга', 'Налаштування']) {
+      expect(within(nav).getByRole('button', { name })).toHaveAccessibleDescription(
+        'Розділи «Черга» і «Налаштування» ще недоступні.',
       );
     }
+  });
+
+  it('collapses the sidebar and expands it again without losing the labels', async () => {
+    installStatus(READY);
+    render(<App />);
+    const sidebar = await screen.findByTestId('sidebar');
+    const toggle = screen.getByTestId('sidebar-toggle');
+
+    expect(sidebar).toHaveAttribute('data-collapsed', 'false');
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(toggle).toHaveAccessibleName('Згорнути панель');
+
+    fireEvent.click(toggle);
+
+    expect(sidebar).toHaveAttribute('data-collapsed', 'true');
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(toggle).toHaveAccessibleName('Розгорнути панель');
+    // Labels stay in the accessibility tree, so a collapsed sidebar is still operable.
+    expect(within(sidebar).getByRole('button', { name: 'Проєкти' })).toBeInTheDocument();
+
+    fireEvent.click(toggle);
+
+    expect(sidebar).toHaveAttribute('data-collapsed', 'false');
   });
 
   it('shows the backend version and no test badge in production mode', async () => {
@@ -97,7 +99,7 @@ describe('App shell before the backend is ready', () => {
   });
 
   it('shows no ready marker before the first status arrives', () => {
-    installBridge(() => new Promise<AppStatus>(() => undefined));
+    installBridge({ getStatus: () => new Promise<AppStatus>(() => undefined) });
     render(<App />);
 
     expect(screen.getByTestId('app-starting')).toBeVisible();
@@ -109,7 +111,7 @@ describe('App shell before the backend is ready', () => {
       .fn<ClipforgeBridge['getStatus']>()
       .mockResolvedValueOnce({ state: 'starting', mode: 'production', version: null })
       .mockResolvedValue(READY);
-    installBridge(getStatus);
+    installBridge({ getStatus, handlers: NO_PROJECTS });
     render(<App />);
 
     await screen.findByTestId('app-starting');
@@ -137,7 +139,7 @@ describe('App shell when the backend fails', () => {
   });
 
   it('shows the error state when the status cannot be read', async () => {
-    installBridge(() => Promise.reject(new Error('IPC refused')));
+    installBridge({ getStatus: () => Promise.reject(new Error('IPC refused')) });
     render(<App />);
 
     expect(await screen.findByTestId('app-error')).toBeVisible();
@@ -154,7 +156,7 @@ describe('App shell when the backend fails', () => {
     const getStatus = vi
       .fn<ClipforgeBridge['getStatus']>()
       .mockResolvedValue({ state: 'failed', mode: 'production', version: null });
-    installBridge(getStatus);
+    installBridge({ getStatus });
     render(<App />);
 
     await screen.findByTestId('app-error');
