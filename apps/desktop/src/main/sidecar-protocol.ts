@@ -108,7 +108,7 @@ export function parseHealthBody(body: unknown, expectedMode: AppMode): string | 
   return null;
 }
 
-export type ApiMethod = 'GET' | 'POST' | 'PATCH';
+export type ApiMethod = 'GET' | 'POST' | 'PATCH' | 'DELETE';
 
 const LOOPBACK = '127.0.0.1';
 const MAX_ERROR_CODE_LENGTH = 100;

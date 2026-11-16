@@ -10,14 +10,25 @@ import { ProjectView } from './ProjectView';
 import type { TabId } from './ProjectView';
 import { ProjectsScreen } from './ProjectsScreen';
 import { restoreLastView } from './restore-view';
+import { SettingsScreen } from './SettingsScreen';
+import { OpenSettingsContext } from './settings-nav';
 import type { ImportNotice } from './SourcesTab';
 import { TestBadge } from './ui';
+import { ViewActiveContext } from './view-active';
 
 const NAV_ITEMS = [
-  { label: 'Проєкти', icon: '▦', enabled: true },
-  { label: 'Черга', icon: '☰', enabled: false },
-  { label: 'Налаштування', icon: '⚙', enabled: false },
+  { id: 'projects', label: 'Проєкти', icon: '▦', enabled: true },
+  { id: 'queue', label: 'Черга', icon: '☰', enabled: false },
+  { id: 'settings', label: 'Налаштування', icon: '⚙', enabled: true },
 ] as const;
+
+/**
+ * `main` is the projects area (list or open project); `settings` takes its place on screen. An open
+ * project is not closed by that: it stays mounted but hidden, so it comes back with its tab, its
+ * export run and its clip selection (and stops playing and listening for shortcuts meanwhile). The
+ * project list and the loading note are not kept; the list reads its data again.
+ */
+type Section = 'main' | 'settings';
 
 /** What the main area shows. `restoring`: the last project is being looked up (docs/03 §12). */
 type Screen =
@@ -45,6 +56,7 @@ interface Memory {
 export function Shell({ status }: { readonly status: AppStatus }) {
   const [collapsed, setCollapsed] = useState(false);
   const [screen, setScreen] = useState<Screen>({ kind: 'restoring' });
+  const [section, setSection] = useState<Section>('main');
   const [layout, setLayout] = useState<PanelLayout>(DEFAULT_LAYOUT);
   const memory = useRef<Memory>({ open: null, layout: DEFAULT_LAYOUT });
 
@@ -102,11 +114,33 @@ export function Shell({ status }: { readonly status: AppStatus }) {
     [remember],
   );
 
+  /** For what is shown inside a project (the speech-recognition block): the same as the sidebar item. */
+  const openSettings = useCallback(() => {
+    setSection('settings');
+  }, []);
+
   const showProjects = useCallback(() => {
+    setSection('main');
     setScreen({ kind: 'projects' });
     memory.current.open = null;
     remember();
   }, [remember]);
+
+  /**
+   * «Проєкти» from the settings goes back to what was open before them, and from anywhere else
+   * shows the project list. Opening the settings changes nothing that is remembered.
+   */
+  const navigate = (id: (typeof NAV_ITEMS)[number]['id']): void => {
+    if (id === 'settings') {
+      setSection('settings');
+    } else if (id === 'projects') {
+      if (section === 'settings') {
+        setSection('main');
+      } else {
+        showProjects();
+      }
+    }
+  };
 
   return (
     <div className="app" data-testid="app-ready">
@@ -114,15 +148,25 @@ export function Shell({ status }: { readonly status: AppStatus }) {
         <nav aria-label="Основна навігація">
           <ul className="nav-list">
             {NAV_ITEMS.map((item) => (
-              <li key={item.label}>
+              <li key={item.id}>
                 <button
                   type="button"
                   className="nav-item"
                   title={item.label}
-                  aria-current={item.enabled ? 'page' : undefined}
+                  aria-current={
+                    item.enabled && (item.id === 'settings') === (section === 'settings')
+                      ? 'page'
+                      : undefined
+                  }
                   aria-describedby={item.enabled ? undefined : 'nav-note'}
                   disabled={!item.enabled}
-                  onClick={item.enabled ? showProjects : undefined}
+                  onClick={
+                    item.enabled
+                      ? () => {
+                          navigate(item.id);
+                        }
+                      : undefined
+                  }
                 >
                   <span className="nav-icon" aria-hidden="true">
                     {item.icon}
@@ -135,7 +179,7 @@ export function Shell({ status }: { readonly status: AppStatus }) {
         </nav>
         <p id="nav-note" className="note nav-note">
           <span aria-hidden="true">ⓘ </span>
-          Розділи «Черга» і «Налаштування» ще недоступні.
+          Розділ «Черга» ще недоступний.
         </p>
         <button
           type="button"
@@ -165,26 +209,33 @@ export function Shell({ status }: { readonly status: AppStatus }) {
           </div>
         </header>
         <main className="main">
-          {screen.kind === 'restoring' && (
+          {section === 'settings' && <SettingsScreen />}
+          {section === 'main' && screen.kind === 'restoring' && (
             <p role="status" data-testid="restoring" className="note">
               Завантажуємо…
             </p>
           )}
-          {screen.kind === 'projects' && <ProjectsScreen onOpen={openProject} />}
+          {section === 'main' && screen.kind === 'projects' && <ProjectsScreen onOpen={openProject} />}
           {screen.kind === 'project' && (
-            <LayoutContext value={layoutControl}>
-              <ProjectView
-                key={screen.project.id}
-                project={screen.project}
-                initialTab={screen.tab}
-                importNotice={screen.notice}
-                onTabChange={(tab) => {
-                  memory.current.open = { projectId: screen.project.id, tab: rememberedTab(tab) };
-                  remember();
-                }}
-                onBack={showProjects}
-              />
-            </LayoutContext>
+            <div data-testid="project-pane" hidden={section === 'settings'}>
+              <ViewActiveContext value={section === 'main'}>
+                <OpenSettingsContext value={openSettings}>
+                  <LayoutContext value={layoutControl}>
+                    <ProjectView
+                      key={screen.project.id}
+                      project={screen.project}
+                      initialTab={screen.tab}
+                      importNotice={screen.notice}
+                      onTabChange={(tab) => {
+                        memory.current.open = { projectId: screen.project.id, tab: rememberedTab(tab) };
+                        remember();
+                      }}
+                      onBack={showProjects}
+                    />
+                  </LayoutContext>
+                </OpenSettingsContext>
+              </ViewActiveContext>
+            </div>
           )}
         </main>
       </div>

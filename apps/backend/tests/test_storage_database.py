@@ -13,7 +13,9 @@ from contextlib import closing
 from pathlib import Path
 
 import pytest
+from alembic import command
 from alembic.autogenerate import compare_metadata
+from alembic.config import Config
 from alembic.migration import MigrationContext
 from sqlalchemy import CheckConstraint, text
 
@@ -22,11 +24,15 @@ from clipforge.storage import (
     Database,
     MigrationError,
     ProjectRepository,
+    SettingsRepository,
     WorkspaceLocked,
     open_database,
 )
 from clipforge.storage.database import BACKUP_DIRNAME, BUSY_TIMEOUT_MS, DB_FILENAME
 from clipforge.storage.migrate import MIGRATIONS_DIR
+
+from .support import head_revision
+from .test_storage_support import add_project, add_source
 
 _CHILD_OPEN = """
 import sys
@@ -357,3 +363,357 @@ def test_model_check_constraints_are_identical_to_the_migration(db: Database) ->
                 assert expected in ddl[table.name]
                 checked += 1
     assert checked >= 10
+
+
+def table_columns(path: Path, table: str) -> list[tuple[str, int, int]]:
+    """``(name, notnull, pk)`` of each column."""
+    with closing(sqlite3.connect(path)) as connection:
+        rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+    return [(row[1], row[3], row[5]) for row in rows]
+
+
+def test_migration_0005_adds_app_settings_and_its_downgrade_drops_it(tmp_path: Path) -> None:
+    only_0004 = make_migrations(tmp_path / "only-0004")
+    for name in (
+        "r0001_initial.py",
+        "r0002_previews.py",
+        "r0003_transcripts.py",
+        "r0004_spend_micro_usd.py",
+    ):
+        shutil.copyfile(MIGRATIONS_DIR / "versions" / name, only_0004 / "versions" / name)
+    data_dir = tmp_path / "data"
+    db_path = data_dir / DB_FILENAME
+    with (
+        open_database(data_dir, migrations_dir=only_0004) as old,
+        old.write_session() as session,
+    ):
+        project_id = ProjectRepository(session).add("Старий проєкт").id
+    assert "app_settings" not in table_names(db_path)
+
+    with open_database(data_dir) as upgraded:
+        assert stored_revision(db_path) == head_revision()
+        assert table_columns(db_path, "app_settings") == [("key", 1, 1), ("value_json", 1, 0)]
+        backup = next((data_dir / BACKUP_DIRNAME).iterdir())
+        assert backup.name.endswith("-from-0004.sqlite3")
+        assert "app_settings" not in table_names(backup)
+        with upgraded.engine.connect() as connection:
+            context = MigrationContext.configure(connection, opts={"compare_type": True})
+            assert compare_metadata(context, Base.metadata) == []
+
+        config = Config()
+        config.set_main_option("script_location", str(MIGRATIONS_DIR).replace("%", "%%"))
+        with upgraded.engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "0004")
+            connection.commit()
+        assert stored_revision(db_path) == "0004"
+        assert "app_settings" not in table_names(db_path)
+        with upgraded.session() as session:
+            project = ProjectRepository(session).get(project_id)
+            assert project is not None
+            assert project.name == "Старий проєкт"
+
+
+_CHUNK_INSERT = (
+    "INSERT INTO transcript_chunks (id, run_id, core_start_ms, core_end_ms, upload_start_ms, "
+    "upload_end_ms, state, attempts, request_id, response_path, error_code, "
+    "reserved_cost, actual_cost) VALUES (?, 'run-1', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+_COSTS_USD = "SELECT id, state, reserved_cost, actual_cost FROM transcript_chunks ORDER BY id"
+_COSTS_MICRO = (
+    "SELECT id, state, reserved_micro_usd, actual_micro_usd FROM transcript_chunks ORDER BY id"
+)
+
+
+def chunk_costs(path: Path, query: str) -> list[tuple[object, ...]]:
+    """``(id, state, reserved, actual)`` of every chunk, in the units the query selects."""
+    with closing(sqlite3.connect(path)) as connection:
+        return connection.execute(query).fetchall()
+
+
+def test_migration_0006_converts_chunk_costs_and_keeps_the_words_that_name_a_chunk(
+    tmp_path: Path,
+) -> None:
+    only_0005 = make_migrations(tmp_path / "only-0005")
+    for name in (
+        "r0001_initial.py",
+        "r0002_previews.py",
+        "r0003_transcripts.py",
+        "r0004_spend_micro_usd.py",
+        "r0005_app_settings.py",
+    ):
+        shutil.copyfile(MIGRATIONS_DIR / "versions" / name, only_0005 / "versions" / name)
+    data_dir = tmp_path / "data"
+    db_path = data_dir / DB_FILENAME
+    with (
+        open_database(data_dir, migrations_dir=only_0005) as old,
+        old.write_session() as session,
+    ):
+        source_id = add_source(session, add_project(session).id).id
+    assert table_columns(db_path, "transcript_chunks")[-2:] == [
+        ("reserved_cost", 1, 0),
+        ("actual_cost", 0, 0),
+    ]
+    with closing(sqlite3.connect(db_path)) as raw:
+        raw.execute("PRAGMA foreign_keys=ON")
+        raw.execute(
+            "INSERT INTO transcript_runs (id, source_id, model, provider, options_hash, status, "
+            "created_at) VALUES "
+            "('run-1', ?, 'm', 'p', 'h', 'running', '2026-11-15T10:00:00.000000Z')",
+            (source_id,),
+        )
+        raw.executemany(
+            _CHUNK_INSERT,
+            [
+                (
+                    "c1",
+                    0,
+                    300_000,
+                    0,
+                    305_000,
+                    "succeeded",
+                    2,
+                    "req-1",
+                    "c1.json",
+                    None,
+                    0.0305,
+                    2e-05,
+                ),
+                (
+                    "c2",
+                    300_000,
+                    600_000,
+                    295_000,
+                    605_000,
+                    "failed",
+                    3,
+                    "req-2",
+                    None,
+                    "E",
+                    1e-07,
+                    None,
+                ),
+                (
+                    "c3",
+                    600_000,
+                    620_000,
+                    595_000,
+                    620_000,
+                    "cancelled",
+                    0,
+                    None,
+                    None,
+                    None,
+                    0.0,
+                    None,
+                ),
+            ],
+        )
+        raw.execute(
+            "INSERT INTO transcript_revisions (id, source_id, revision, origin, run_id, parent_id, "
+            "timing_level, language, duration_ms, word_count, segment_count, coverage, "
+            "metadata_json, created_at) VALUES ('rev-1', ?, 1, 'stt', 'run-1', NULL, 'word', "
+            "'en', 60000, 1, 0, '[]', '{}', '2026-11-15T10:00:00.000000Z')",
+            (source_id,),
+        )
+        raw.execute(
+            "INSERT INTO transcript_words (revision_id, id, ordinal, start_ms, end_ms, text, "
+            "chunk_id) VALUES ('rev-1', 'w1', 0, 0, 500, 'hello', 'c1')"
+        )
+        raw.commit()
+
+    with open_database(data_dir) as upgraded:
+        assert stored_revision(db_path) == head_revision()
+        assert table_columns(db_path, "transcript_chunks")[-2:] == [
+            ("reserved_micro_usd", 1, 0),
+            ("actual_micro_usd", 0, 0),
+        ]
+        # Rounded UP to a micro-USD; a missing cost stays missing.
+        expected_up = [
+            ("c1", "succeeded", 30_500, 20),
+            ("c2", "failed", 1, None),
+            ("c3", "cancelled", 0, None),
+        ]
+        assert chunk_costs(db_path, _COSTS_MICRO) == expected_up
+        backup = next((data_dir / BACKUP_DIRNAME).iterdir())
+        assert backup.name.endswith("-from-0005.sqlite3")
+        assert table_columns(backup, "transcript_chunks")[-2][0] == "reserved_cost"
+        with upgraded.engine.connect() as connection:
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+            context = MigrationContext.configure(connection, opts={"compare_type": True})
+            assert compare_metadata(context, Base.metadata) == []
+            word = connection.exec_driver_sql(
+                "SELECT chunk_id FROM transcript_words WHERE revision_id = 'rev-1'"
+            ).all()
+            assert word == [("c1",)]
+        with upgraded.engine.begin() as connection:
+            index = connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'transcript_chunks' AND name NOT LIKE 'sqlite_%'"
+            ).all()
+            assert index == [("ix_transcript_chunks_run_id",)]
+            # The new state is accepted, the old table's costs are gone from the model's view.
+            connection.exec_driver_sql(
+                "INSERT INTO transcript_chunks (id, run_id, core_start_ms, core_end_ms, "
+                "upload_start_ms, upload_end_ms, state, attempts, reserved_micro_usd) "
+                "VALUES ('c4', 'run-1', 0, 1000, 0, 1000, 'superseded', 1, 5)"
+            )
+
+        config = Config()
+        config.set_main_option("script_location", str(MIGRATIONS_DIR).replace("%", "%%"))
+        with upgraded.engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "0005")
+            connection.commit()
+        assert stored_revision(db_path) == "0005"
+        # The superseded parent is dropped, the costs are USD again, the word still names its chunk.
+        assert chunk_costs(db_path, _COSTS_USD) == [
+            ("c1", "succeeded", 0.0305, 2e-05),
+            ("c2", "failed", 1e-06, None),
+            ("c3", "cancelled", 0.0, None),
+        ]
+        with upgraded.engine.connect() as connection:
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+            assert connection.exec_driver_sql("SELECT chunk_id FROM transcript_words").all() == [
+                ("c1",)
+            ]
+
+        with upgraded.engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "head")
+            connection.commit()
+        assert stored_revision(db_path) == head_revision()
+        assert chunk_costs(db_path, _COSTS_MICRO) == [
+            ("c1", "succeeded", 30_500, 20),
+            ("c2", "failed", 1, None),
+            ("c3", "cancelled", 0, None),
+        ]
+
+
+def test_a_failed_0006_rebuild_leaves_the_old_table_and_its_words_untouched(
+    tmp_path: Path,
+) -> None:
+    """The table is dropped and created again inside the upgrade transaction: when a row cannot
+    be put back, nothing is kept of the attempt."""
+    only_0005 = make_migrations(tmp_path / "only-0005")
+    for name in (
+        "r0001_initial.py",
+        "r0002_previews.py",
+        "r0003_transcripts.py",
+        "r0004_spend_micro_usd.py",
+        "r0005_app_settings.py",
+    ):
+        shutil.copyfile(MIGRATIONS_DIR / "versions" / name, only_0005 / "versions" / name)
+    data_dir = tmp_path / "data"
+    db_path = data_dir / DB_FILENAME
+    with (
+        open_database(data_dir, migrations_dir=only_0005) as old,
+        old.write_session() as session,
+    ):
+        source_id = add_source(session, add_project(session).id).id
+    with closing(sqlite3.connect(db_path)) as raw:
+        raw.execute("PRAGMA foreign_keys=ON")
+        raw.execute(
+            "INSERT INTO transcript_runs (id, source_id, model, provider, options_hash, status, "
+            "created_at) VALUES "
+            "('run-1', ?, 'm', 'p', 'h', 'running', '2026-11-15T10:00:00.000000Z')",
+            (source_id,),
+        )
+        # A state the new table's CHECK refuses: the row cannot be put back, the rebuild fails.
+        raw.execute("PRAGMA ignore_check_constraints=ON")
+        raw.execute(_CHUNK_INSERT, ("c1", 0, 1000, 0, 1000, "odd", 0, None, None, None, 0.0, None))
+        raw.execute("PRAGMA ignore_check_constraints=OFF")
+        raw.execute(
+            "INSERT INTO transcript_revisions (id, source_id, revision, origin, run_id, parent_id, "
+            "timing_level, language, duration_ms, word_count, segment_count, coverage, "
+            "metadata_json, created_at) VALUES ('rev-1', ?, 1, 'stt', 'run-1', NULL, 'word', "
+            "'en', 60000, 1, 0, '[]', '{}', '2026-11-15T10:00:00.000000Z')",
+            (source_id,),
+        )
+        raw.execute(
+            "INSERT INTO transcript_words (revision_id, id, ordinal, start_ms, end_ms, text, "
+            "chunk_id) VALUES ('rev-1', 'w1', 0, 0, 500, 'hello', 'c1')"
+        )
+        raw.commit()
+
+    with pytest.raises(MigrationError):
+        open_database(data_dir)
+
+    assert stored_revision(db_path) == "0005"
+    assert chunk_costs(db_path, _COSTS_USD) == [("c1", "odd", 0.0, None)]
+
+
+def test_settings_repository_stores_replaces_and_deletes_values(db: Database) -> None:
+    with db.write_session() as session:
+        settings = SettingsRepository(session)
+        assert settings.get_many(["stt_language", "run_budget_usd"]) == {}
+        settings.set("stt_language", "en")
+        settings.set("run_budget_usd", "12.50")
+        settings.set("stt_language", "uk")  # replaces
+        settings.set("other", "x")
+    with db.session() as session:
+        settings = SettingsRepository(session)
+        assert settings.get_many(["stt_language", "run_budget_usd", "missing"]) == {
+            "stt_language": "uk",
+            "run_budget_usd": "12.50",
+        }
+    with db.write_session() as session:
+        settings = SettingsRepository(session)
+        settings.delete("stt_language")
+        settings.delete("never_set")  # nothing happens
+    with db.session() as session:
+        assert SettingsRepository(session).get_many(["stt_language", "run_budget_usd"]) == {
+            "run_budget_usd": "12.50"
+        }
+    with closing(sqlite3.connect(db.data_dir / DB_FILENAME)) as raw:
+        stored = raw.execute("SELECT value_json FROM app_settings WHERE key = 'run_budget_usd'")
+        assert stored.fetchall() == [('{"schema_version":1,"value":"12.50"}',)]
+
+
+def test_settings_repository_refuses_null_because_a_reset_is_a_delete(db: Database) -> None:
+    with db.write_session() as session, pytest.raises(ValueError, match="null"):
+        SettingsRepository(session).set("stt_language", None)
+
+
+def put_raw_setting(db: Database, key: str, stored: str) -> None:
+    with closing(sqlite3.connect(db.data_dir / DB_FILENAME)) as raw:
+        raw.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value_json) VALUES (?, ?)", (key, stored)
+        )
+        raw.commit()
+
+
+def raw_settings(db: Database) -> dict[str, str]:
+    with closing(sqlite3.connect(db.data_dir / DB_FILENAME)) as raw:
+        return dict(raw.execute("SELECT key, value_json FROM app_settings").fetchall())
+
+
+def test_settings_repository_skips_a_damaged_row_and_can_replace_or_delete_it(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    put_raw_setting(db, "bad_text", "not json SECRET-TEXT")
+    put_raw_setting(db, "bad_version", '{"schema_version":2,"value":"SECRET-TEXT"}')
+    put_raw_setting(db, "bad_shape", '"SECRET-TEXT"')
+    put_raw_setting(db, "good", '{"schema_version":1,"value":"ok"}')
+    keys = ["bad_text", "bad_version", "bad_shape", "good", "missing"]
+
+    with db.session() as session:
+        assert SettingsRepository(session).get_many(keys) == {"good": "ok"}  # no exception
+
+    # Only the key names are logged, never the stored text.
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 3
+    for key in ("bad_text", "bad_version", "bad_shape"):
+        assert sum(key in message for message in messages) == 1
+    assert "SECRET-TEXT" not in caplog.text
+    with db.write_session() as session:
+        settings = SettingsRepository(session)
+        settings.set("bad_text", "fixed")  # replaces a row that cannot be read
+        settings.delete("bad_version")  # removes one
+    with db.session() as session:
+        assert SettingsRepository(session).get_many(keys) == {"good": "ok", "bad_text": "fixed"}
+    assert raw_settings(db) == {
+        "bad_text": '{"schema_version":1,"value":"fixed"}',
+        "bad_shape": '"SECRET-TEXT"',  # untouched: nobody asked for it
+        "good": '{"schema_version":1,"value":"ok"}',
+    }

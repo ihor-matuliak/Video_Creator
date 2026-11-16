@@ -33,7 +33,9 @@ from clipforge.adapters.media_tools import (
 from clipforge.api.app import create_app
 from clipforge.api.security import LOOPBACK_HOST
 from clipforge.config import Config, ConfigError, load_config
+from clipforge.services.credentials import openrouter_key_checker
 from clipforge.services.runtime import Runtime
+from clipforge.services.transcription_jobs import openrouter_stt_factory
 from clipforge.storage import StorageError
 
 _MAX_CONFIG_LINE_BYTES = 16 * 1024
@@ -80,7 +82,12 @@ def _start_runtime(config: Config) -> Runtime | None:
         print(f"clipforge: {exc.message}; маршрути з відео повертатимуть 503", file=sys.stderr)
         media_tools = None
     try:
-        return Runtime.start(config.data_dir, media_tools=media_tools)
+        return Runtime.start(
+            config.data_dir,
+            media_tools=media_tools,
+            stt_client_factory=openrouter_stt_factory(config),
+            key_checker=openrouter_key_checker(config),
+        )
     except StorageError as exc:
         # Storage messages are Ukrainian and free of paths and stored values.
         print(f"clipforge: {exc}", file=sys.stderr)

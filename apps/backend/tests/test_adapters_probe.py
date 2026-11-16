@@ -10,6 +10,8 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+from collections.abc import Sequence
 from fractions import Fraction
 from pathlib import Path
 
@@ -478,3 +480,71 @@ def test_timeout_is_typed(tools: MediaTools) -> None:
     with pytest.raises(ProbeTimeoutError) as error:
         probe_source(tools.ffprobe, fixture("color_gop.mp4"), timeout_s=0.000001)
     assert error.value.code == "PROBE_TIMEOUT"
+
+
+# --- Matroska end of stream: seek answer without packets ---------------------------------
+
+MATROSKA_CONTAINER: dict[str, object] = {"start_time": "0.000000", "duration": "12.000000"}
+
+
+def _answer_ffprobe(
+    monkeypatch: pytest.MonkeyPatch, documents: list[dict[str, object]]
+) -> list[list[str]]:
+    """Make every ffprobe call return the next document; returns the argv of each call."""
+    calls: list[list[str]] = []
+
+    def run(argv: Sequence[str], *, timeout_s: float) -> subprocess.CompletedProcess[bytes]:
+        document = documents[len(calls)]
+        calls.append(list(argv))
+        stdout = json.dumps(document).encode("utf-8")
+        return subprocess.CompletedProcess(list(argv), 0, stdout, b"")
+
+    monkeypatch.setattr(ffprobe_module, "run_short", run)
+    return calls
+
+
+def test_empty_seek_answer_is_read_again_without_read_intervals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _answer_ffprobe(
+        monkeypatch,
+        [
+            {"packets": []},
+            {
+                "packets": [
+                    {"pts": 10000, "duration": 1000, "flags": "K__"},
+                    {"pts": 11000, "duration": 500, "flags": "__"},
+                ]
+            },
+        ],
+    )
+    end = ffprobe_module._video_end_pts(
+        tmp_path / "ffprobe.exe",
+        tmp_path / "source.mkv",
+        {"index": 0, "codec_type": "video"},
+        0,
+        MATROSKA_CONTAINER,
+        60.0,
+    )
+    assert end == 11500
+    assert len(calls) == 2
+    assert "-read_intervals" in calls[0]
+    assert "-read_intervals" not in calls[1]
+    assert calls[1][calls[1].index("-select_streams") + 1] == "0"
+
+
+def test_empty_seek_and_empty_full_read_are_unreadable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _answer_ffprobe(monkeypatch, [{"packets": []}, {"packets": []}])
+    with pytest.raises(SourceUnreadableError) as error:
+        ffprobe_module._video_end_pts(
+            tmp_path / "ffprobe.exe",
+            tmp_path / "source.mkv",
+            {"index": 0, "codec_type": "video"},
+            0,
+            MATROSKA_CONTAINER,
+            60.0,
+        )
+    assert error.value.message == "Не вдалося визначити тривалість відео"
+    assert len(calls) == 2

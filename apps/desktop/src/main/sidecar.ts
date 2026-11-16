@@ -103,6 +103,7 @@ export class Sidecar {
   #stdoutBuffer = '';
   #stderrTail = '';
   #startupTimer: NodeJS.Timeout | undefined;
+  readonly #readyListeners: (() => void)[] = [];
 
   constructor(options: SidecarOptions) {
     this.#options = options;
@@ -117,6 +118,15 @@ export class Sidecar {
 
   getStatus(): AppStatus {
     return { state: this.#state, mode: this.#options.mode, version: this.#version };
+  }
+
+  /**
+   * Calls `listener` every time the sidecar becomes ready, right after `request` starts to work
+   * and before any status answer can show `ready`. A listener that throws does not stop the
+   * monitor. Register before `start()`.
+   */
+  onReady(listener: () => void): void {
+    this.#readyListeners.push(listener);
   }
 
   start(): void {
@@ -385,6 +395,7 @@ export class Sidecar {
             clearTimeout(this.#startupTimer);
             this.#version = version;
             this.#state = 'ready';
+            this.#notifyReady();
           }
         } else if (version === null) {
           failures += 1;
@@ -400,6 +411,16 @@ export class Sidecar {
       }
     } catch {
       // The pause was aborted by stop() or by a failure: nothing left to do.
+    }
+  }
+
+  #notifyReady(): void {
+    for (const listener of this.#readyListeners) {
+      try {
+        listener();
+      } catch {
+        // A listener is not allowed to break the health monitor; it reports its own trouble.
+      }
     }
   }
 

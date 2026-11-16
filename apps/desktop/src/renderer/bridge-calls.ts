@@ -1,9 +1,11 @@
 import type { ApiData, ApiOp, ApiParams } from '../shared/api';
 import { apiFailure } from '../shared/bridge';
 import type {
+  ApiKeyStatus,
   ApiResult,
   ChooseFolderResult,
   FolderOpened,
+  ImportTranscriptResult,
   ImportVideoResult,
   PickVideoResult,
   ViewState,
@@ -28,6 +30,33 @@ export async function callApi<O extends ApiOp>(
 
 /** The failed half of an `ApiResult`. */
 export type ApiFailureResult = Extract<ApiResult<never>, { readonly ok: false }>;
+
+/** `window.clipforge.getApiKeyStatus` that never rejects, like `callApi`. */
+export async function loadApiKeyStatus(): Promise<ApiResult<ApiKeyStatus>> {
+  try {
+    return { ok: true, data: await window.clipforge.getApiKeyStatus() };
+  } catch {
+    return apiFailure('BRIDGE_ERROR', UNREACHABLE_MESSAGE, true);
+  }
+}
+
+/** `window.clipforge.setApiKey` that never rejects. The key goes to main and is not kept here. */
+export async function saveApiKey(key: string): Promise<ApiResult<ApiKeyStatus>> {
+  try {
+    return await window.clipforge.setApiKey(key);
+  } catch {
+    return apiFailure('BRIDGE_ERROR', UNREACHABLE_MESSAGE, true);
+  }
+}
+
+/** `window.clipforge.forgetApiKey` that never rejects, like `callApi`. */
+export async function removeApiKey(): Promise<ApiResult<ApiKeyStatus>> {
+  try {
+    return await window.clipforge.forgetApiKey();
+  } catch {
+    return apiFailure('BRIDGE_ERROR', UNREACHABLE_MESSAGE, true);
+  }
+}
 
 /** `window.clipforge.chooseExportFolder` that never rejects, like `callApi`. */
 export async function chooseExportFolder(): Promise<ChooseFolderResult | ApiFailureResult> {
@@ -56,6 +85,18 @@ export async function importVideo(projectId: string, fileToken?: string): Promis
     return await window.clipforge.importVideo(
       fileToken === undefined ? { project_id: projectId } : { project_id: projectId, file_token: fileToken },
     );
+  } catch {
+    return apiFailure('BRIDGE_ERROR', UNREACHABLE_MESSAGE, true);
+  }
+}
+
+/**
+ * `window.clipforge.importTranscript` that never rejects, like `callApi`. Main shows the subtitle
+ * dialog and reads the file itself; a cancel is `{ canceled: true }` (ADR 039). No key is needed.
+ */
+export async function importTranscript(sourceId: string): Promise<ImportTranscriptResult> {
+  try {
+    return await window.clipforge.importTranscript({ source_id: sourceId });
   } catch {
     return apiFailure('BRIDGE_ERROR', UNREACHABLE_MESSAGE, true);
   }

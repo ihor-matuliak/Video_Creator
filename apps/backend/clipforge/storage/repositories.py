@@ -8,18 +8,56 @@ services layer.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
 
-from sqlalchemy import CursorResult, Result, Select, and_, func, or_, select, text, update
+from sqlalchemy import (
+    CursorResult,
+    Result,
+    Select,
+    Text,
+    and_,
+    case,
+    delete,
+    func,
+    insert,
+    or_,
+    select,
+    text,
+    type_coerce,
+    update,
+)
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import InstrumentedAttribute, Session
 
 from .database import CASEFOLD_FUNCTION
-from .errors import RecordNotFound, StaleRevision
-from .models import Clip, ExportBatch, ExportItem, Job, Preview, Project, Source
+from .errors import RecordNotFound, StaleRevision, StorageError
+from .models import (
+    SPEND_COUNTS_ACTUAL,
+    SPEND_COUNTS_NOTHING,
+    SPEND_COUNTS_RESERVED,
+    AppSetting,
+    Clip,
+    ExportBatch,
+    ExportItem,
+    Job,
+    Preview,
+    Project,
+    Source,
+    SpendEntry,
+    TranscriptChunk,
+    TranscriptRevision,
+    TranscriptRun,
+    TranscriptSegment,
+    TranscriptWord,
+)
+from .types import decode_versioned_json
 from .util import new_id, utc_now
+
+_LOGGER = logging.getLogger(__name__)
 
 MAX_PAGE_SIZE: Final = 1000
 
@@ -30,6 +68,18 @@ CLIP_EDITABLE_FIELDS: Final = frozenset(
 )
 EXPORT_ITEM_MUTABLE_FIELDS: Final = frozenset(
     {"state", "temp_path", "final_path", "observed_json", "error_code"}
+)
+RUN_MUTABLE_FIELDS: Final = frozenset({"status", "coverage", "usage"})
+CHUNK_MUTABLE_FIELDS: Final = frozenset(
+    {
+        "state",
+        "attempts",
+        "request_id",
+        "response_path",
+        "error_code",
+        "reserved_micro_usd",
+        "actual_micro_usd",
+    }
 )
 
 Clock = Callable[[], str]
@@ -709,6 +759,15 @@ class JobRepository:
         )
         return self._session.scalars(statement).first()
 
+    def list_by_type(self, job_type: str, states: Collection[str]) -> list[Job]:
+        """Jobs of ``job_type`` in any of ``states``, oldest first."""
+        statement = (
+            select(Job)
+            .where(Job.type == job_type, Job.state.in_(tuple(states)))
+            .order_by(Job.created_at, Job.id)
+        )
+        return list(self._session.scalars(statement))
+
     def set_state(self, job_id: str, state: str) -> Job:
         job = self._require(job_id)
         job.state = state
@@ -770,3 +829,437 @@ class JobRepository:
         if job is None:
             raise RecordNotFound("job", job_id)
         return job
+
+
+@dataclass(frozen=True, slots=True)
+class NewWord:
+    """A word to store: ``start_ms``/``end_ms`` are source milliseconds, ``[start, end)``."""
+
+    id: str
+    ordinal: int
+    start_ms: int
+    end_ms: int
+    text: str
+    chunk_id: str | None = None
+    speaker_local: str | None = None
+    confidence: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NewSegment:
+    id: str
+    ordinal: int
+    start_ms: int
+    end_ms: int
+    text: str
+    word_ids: Sequence[str] = ()
+
+
+class TranscriptRepository:
+    """Transcript revisions with their words and segments. Everything is write-once: there is no
+    update or delete method, and the database refuses both (migration 0003)."""
+
+    def __init__(self, session: Session, *, now: Clock = utc_now) -> None:
+        self._session = session
+        self._now = now
+
+    def add_revision(
+        self,
+        *,
+        source_id: str,
+        origin: str,
+        timing_level: str,
+        language: str,
+        duration_ms: int,
+        coverage: Sequence[Mapping[str, Any]],
+        metadata: Mapping[str, Any],
+        words: Sequence[NewWord] = (),
+        segments: Sequence[NewSegment] = (),
+        run_id: str | None = None,
+        parent_id: str | None = None,
+    ) -> TranscriptRevision:
+        """Write a new revision with all its words and segments; the revision number is the
+        source's highest plus one. Call it inside ``Database.write_session()`` so two writers
+        cannot take the same number (the unique key would reject the second one anyway).
+
+        Segments get the revision's ``timing_level``. Whether ``origin`` fits ``run_id`` and
+        ``parent_id`` is a DB CHECK.
+        """
+        highest = self._session.scalar(
+            select(func.max(TranscriptRevision.revision)).where(
+                TranscriptRevision.source_id == source_id
+            )
+        )
+        revision = TranscriptRevision(
+            id=new_id(),
+            source_id=source_id,
+            revision=(highest or 0) + 1,
+            origin=origin,
+            run_id=run_id,
+            parent_id=parent_id,
+            timing_level=timing_level,
+            language=language,
+            duration_ms=duration_ms,
+            word_count=len(words),
+            segment_count=len(segments),
+            coverage=[dict(span) for span in coverage],
+            metadata_json=dict(metadata),
+            created_at=self._now(),
+        )
+        self._session.add(revision)
+        self._session.flush()
+        if words:
+            self._session.execute(
+                insert(TranscriptWord),
+                [
+                    {
+                        "revision_id": revision.id,
+                        "id": word.id,
+                        "ordinal": word.ordinal,
+                        "start_ms": word.start_ms,
+                        "end_ms": word.end_ms,
+                        "text": word.text,
+                        "chunk_id": word.chunk_id,
+                        "speaker_local": word.speaker_local,
+                        "confidence": word.confidence,
+                    }
+                    for word in words
+                ],
+            )
+        if segments:
+            self._session.execute(
+                insert(TranscriptSegment),
+                [
+                    {
+                        "revision_id": revision.id,
+                        "id": segment.id,
+                        "ordinal": segment.ordinal,
+                        "start_ms": segment.start_ms,
+                        "end_ms": segment.end_ms,
+                        "text": segment.text,
+                        "word_ids": list(segment.word_ids),
+                        "timing_level": timing_level,
+                    }
+                    for segment in segments
+                ],
+            )
+        return revision
+
+    def get(self, revision_id: str) -> TranscriptRevision | None:
+        return self._session.get(TranscriptRevision, revision_id)
+
+    def list_page_for_source(
+        self, source_id: str, *, limit: int = 50, after: str | None = None
+    ) -> Page[TranscriptRevision]:
+        """Revisions of one source in revision order; ``after`` is the id of the last revision of
+        the previous page (it must belong to the same source)."""
+        if not 1 <= limit <= MAX_PAGE_SIZE:
+            raise ValueError(f"limit має бути від 1 до {MAX_PAGE_SIZE}")
+        statement = select(TranscriptRevision).where(TranscriptRevision.source_id == source_id)
+        if after is not None:
+            marker = self._session.scalar(
+                select(TranscriptRevision.revision).where(
+                    TranscriptRevision.id == after, TranscriptRevision.source_id == source_id
+                )
+            )
+            if marker is None:
+                raise ValueError("Невідомий курсор")
+            statement = statement.where(TranscriptRevision.revision > marker)
+        rows = list(
+            self._session.scalars(statement.order_by(TranscriptRevision.revision).limit(limit + 1))
+        )
+        if len(rows) > limit:
+            rows = rows[:limit]
+            return Page(items=rows, next_cursor=rows[-1].id)
+        return Page(items=rows, next_cursor=None)
+
+    def list_words(
+        self, revision_id: str, *, offset: int = 0, limit: int = MAX_PAGE_SIZE
+    ) -> list[TranscriptWord]:
+        """Words of the revision in ordinal order: the ``limit`` words after skipping ``offset``."""
+        _check_window(offset, limit)
+        statement = (
+            select(TranscriptWord)
+            .where(TranscriptWord.revision_id == revision_id)
+            .order_by(TranscriptWord.ordinal)
+            .offset(offset)
+            .limit(limit)
+        )
+        return list(self._session.scalars(statement))
+
+    def list_segments(
+        self, revision_id: str, *, offset: int = 0, limit: int = MAX_PAGE_SIZE
+    ) -> list[TranscriptSegment]:
+        """Segments of the revision in ordinal order, windowed like ``list_words``."""
+        _check_window(offset, limit)
+        statement = (
+            select(TranscriptSegment)
+            .where(TranscriptSegment.revision_id == revision_id)
+            .order_by(TranscriptSegment.ordinal)
+            .offset(offset)
+            .limit(limit)
+        )
+        return list(self._session.scalars(statement))
+
+
+def _check_window(offset: int, limit: int) -> None:
+    if offset < 0:
+        raise ValueError("offset не може бути від'ємним")
+    if not 1 <= limit <= MAX_PAGE_SIZE:
+        raise ValueError(f"limit має бути від 1 до {MAX_PAGE_SIZE}")
+
+
+class TranscriptRunRepository:
+    """STT runs and their chunks. Which states a run or a chunk goes through is the business of
+    ``clipforge.services.transcription_runs``: this class stores what it is given."""
+
+    def __init__(self, session: Session, *, now: Clock = utc_now) -> None:
+        self._session = session
+        self._now = now
+
+    def add_run(
+        self,
+        *,
+        source_id: str,
+        model: str,
+        provider: str,
+        options_hash: str,
+        status: str,
+        coverage: Sequence[Mapping[str, Any]] | None = None,
+        usage: Mapping[str, Any] | None = None,
+    ) -> TranscriptRun:
+        run = TranscriptRun(
+            id=new_id(),
+            source_id=source_id,
+            model=model,
+            provider=provider,
+            options_hash=options_hash,
+            status=status,
+            coverage=[dict(span) for span in coverage] if coverage is not None else None,
+            usage=dict(usage) if usage is not None else None,
+            created_at=self._now(),
+        )
+        self._session.add(run)
+        self._session.flush()
+        return run
+
+    def get_run(self, run_id: str) -> TranscriptRun | None:
+        return self._session.get(TranscriptRun, run_id)
+
+    def list_runs_for_source(self, source_id: str) -> list[TranscriptRun]:
+        """Every run of the source, the newest first: by ``created_at`` (fixed-width UTC text, so
+        text order is time order), ties by id."""
+        statement = (
+            select(TranscriptRun)
+            .where(TranscriptRun.source_id == source_id)
+            .order_by(TranscriptRun.created_at.desc(), TranscriptRun.id.desc())
+        )
+        return list(self._session.scalars(statement))
+
+    def update_run(self, run_id: str, **changes: Any) -> TranscriptRun:
+        """Only ``RUN_MUTABLE_FIELDS``; the source, model, provider and options are fixed."""
+        unknown = sorted(set(changes) - RUN_MUTABLE_FIELDS)
+        if unknown:
+            raise ValueError(f"Непідтримувані поля запуску розпізнавання: {', '.join(unknown)}")
+        run = self._session.get(TranscriptRun, run_id)
+        if run is None:
+            raise RecordNotFound("transcript_run", run_id)
+        for name, value in changes.items():
+            setattr(run, name, value)
+        self._session.flush()
+        return run
+
+    def add_chunk(
+        self,
+        *,
+        run_id: str,
+        core_start_ms: int,
+        core_end_ms: int,
+        upload_start_ms: int,
+        upload_end_ms: int,
+        state: str = "pending",
+        reserved_micro_usd: int = 0,
+    ) -> TranscriptChunk:
+        """A chunk window of the run: the core ``[core_start, core_end)`` lies inside the upload
+        window. ``state`` is one of ``models.CHUNK_STATES`` (a DB CHECK)."""
+        chunk = TranscriptChunk(
+            id=new_id(),
+            run_id=run_id,
+            core_start_ms=core_start_ms,
+            core_end_ms=core_end_ms,
+            upload_start_ms=upload_start_ms,
+            upload_end_ms=upload_end_ms,
+            state=state,
+            attempts=0,
+            request_id=None,
+            response_path=None,
+            error_code=None,
+            reserved_micro_usd=reserved_micro_usd,
+            actual_micro_usd=None,
+        )
+        self._session.add(chunk)
+        self._session.flush()
+        return chunk
+
+    def get_chunk(self, chunk_id: str) -> TranscriptChunk | None:
+        return self._session.get(TranscriptChunk, chunk_id)
+
+    def update_chunk(self, chunk_id: str, **changes: Any) -> TranscriptChunk:
+        """Only ``CHUNK_MUTABLE_FIELDS``; the run and the four window numbers are fixed."""
+        unknown = sorted(set(changes) - CHUNK_MUTABLE_FIELDS)
+        if unknown:
+            raise ValueError(f"Непідтримувані поля частини розпізнавання: {', '.join(unknown)}")
+        chunk = self._session.get(TranscriptChunk, chunk_id)
+        if chunk is None:
+            raise RecordNotFound("transcript_chunk", chunk_id)
+        for name, value in changes.items():
+            setattr(chunk, name, value)
+        self._session.flush()
+        return chunk
+
+    def list_chunks(self, run_id: str) -> list[TranscriptChunk]:
+        statement = (
+            select(TranscriptChunk)
+            .where(TranscriptChunk.run_id == run_id)
+            .order_by(TranscriptChunk.core_start_ms, TranscriptChunk.id)
+        )
+        return list(self._session.scalars(statement))
+
+
+class SpendRepository:
+    """The rows of the paid-request ledger. Money is whole micro-USD; the Decimal conversion, the
+    budget check and the allowed state changes are ``clipforge.services.spend``'s."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(
+        self,
+        *,
+        run_id: str,
+        request_id: str,
+        state: str,
+        reserved_micro_usd: int,
+        model: str,
+        price_snapshot: Mapping[str, Any],
+        actual_micro_usd: int | None = None,
+    ) -> SpendEntry:
+        """One entry per ``(run_id, request_id)``: recording a request twice is a DB error."""
+        entry = SpendEntry(
+            id=new_id(),
+            run_id=run_id,
+            request_id=request_id,
+            state=state,
+            reserved_micro_usd=reserved_micro_usd,
+            actual_micro_usd=actual_micro_usd,
+            model=model,
+            price_snapshot=dict(price_snapshot),
+        )
+        self._session.add(entry)
+        self._session.flush()
+        return entry
+
+    def get(self, entry_id: str) -> SpendEntry | None:
+        """Always the stored row, also after ``transition`` changed it behind the session."""
+        statement = (
+            select(SpendEntry)
+            .where(SpendEntry.id == entry_id)
+            .execution_options(populate_existing=True)
+        )
+        return self._session.scalars(statement).first()
+
+    def find(self, run_id: str, request_id: str) -> SpendEntry | None:
+        statement = select(SpendEntry).where(
+            SpendEntry.run_id == run_id, SpendEntry.request_id == request_id
+        )
+        return self._session.scalars(statement).first()
+
+    def list_for_run(self, run_id: str) -> list[SpendEntry]:
+        statement = (
+            select(SpendEntry).where(SpendEntry.run_id == run_id).order_by(SpendEntry.request_id)
+        )
+        return list(self._session.scalars(statement))
+
+    def committed_micro_usd(self, run_id: str) -> int:
+        """What the run has spent or may still spend: a ``completed`` entry counts its actual
+        cost (its reservation when the cost is unknown), a ``reserved`` or ``unknown_outcome``
+        entry its reservation, a ``released`` entry nothing (the groups are ``SPEND_COUNTS_*``).
+        One aggregate query, so the figure is exact and consistent inside one transaction."""
+        counted = case(
+            (
+                SpendEntry.state.in_(SPEND_COUNTS_ACTUAL),
+                func.coalesce(SpendEntry.actual_micro_usd, SpendEntry.reserved_micro_usd),
+            ),
+            (SpendEntry.state.in_(SPEND_COUNTS_RESERVED), SpendEntry.reserved_micro_usd),
+            (SpendEntry.state.in_(SPEND_COUNTS_NOTHING), 0),
+            else_=0,
+        )
+        total = self._session.scalar(
+            select(func.coalesce(func.sum(counted), 0)).where(SpendEntry.run_id == run_id)
+        )
+        return int(total or 0)
+
+    def transition(
+        self,
+        entry_id: str,
+        to_state: str,
+        *,
+        from_states: Collection[str],
+        actual_micro_usd: int | None = None,
+    ) -> bool:
+        """Compare-and-set of the state: one ``UPDATE ... WHERE state IN (...)``. Returns whether
+        this call changed the row; ``actual_micro_usd`` replaces the stored value. A bulk UPDATE
+        does not touch entries already loaded in the session: read the row back with ``get``."""
+        statement = (
+            update(SpendEntry)
+            .where(SpendEntry.id == entry_id, SpendEntry.state.in_(tuple(from_states)))
+            .values(state=to_state, actual_micro_usd=actual_micro_usd)
+            .execution_options(synchronize_session=False)
+        )
+        return _rowcount(self._session.execute(statement)) == 1
+
+
+class SettingsRepository:
+    """The rows of ``app_settings``. Which keys exist and which values are allowed is
+    ``clipforge.services.settings``'s: this class stores whatever JSON value it is given."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def get_many(self, keys: Collection[str]) -> dict[str, Any]:
+        """The stored value of each of ``keys`` that has a readable row; the others are absent.
+
+        A row whose text is not versioned JSON (the file was edited by hand or damaged) counts as
+        absent: one bad row must not break the others. Only its key is logged, never its text.
+        ``set`` and ``delete`` still work on such a row, so it can be replaced or removed.
+        """
+        # The column is read as plain text: the versioned-JSON decoding of the model would raise
+        # for the whole result set on the first bad row.
+        statement = select(AppSetting.key, type_coerce(AppSetting.value_json, Text)).where(
+            AppSetting.key.in_(tuple(keys))
+        )
+        values: dict[str, Any] = {}
+        for key, stored in self._session.execute(statement):
+            try:
+                values[key] = decode_versioned_json(stored)
+            except StorageError:
+                _LOGGER.warning("The stored value of setting %s is unreadable: ignored", key)
+        return values
+
+    def set(self, key: str, value: Any) -> None:
+        """Store ``value`` (never ``None``: use ``delete``) under ``key``, replacing a row, also
+        one whose text cannot be read."""
+        if value is None:
+            raise ValueError("Значення налаштування не може бути null: використайте delete")
+        # One upsert, no load of the old row: loading would decode (and fail on) a damaged text.
+        insertion = sqlite_insert(AppSetting).values(key=key, value_json=value)
+        self._session.execute(
+            insertion.on_conflict_do_update(
+                index_elements=[AppSetting.key], set_={"value_json": insertion.excluded.value_json}
+            )
+        )
+
+    def delete(self, key: str) -> None:
+        """Remove the row of ``key``, also one whose text cannot be read; nothing happens when
+        there is none."""
+        self._session.execute(delete(AppSetting).where(AppSetting.key == key))

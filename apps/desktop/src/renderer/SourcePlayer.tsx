@@ -14,6 +14,7 @@ import {
 import { HOTKEY_LABELS } from './hotkey-logic';
 import { StatusText } from './ui';
 import { usePreviewProxy } from './use-preview-proxy';
+import { useViewActive } from './view-active';
 
 /** What the clip forms and the keyboard shortcuts may ask of the player. */
 export interface PlayerHandle {
@@ -114,6 +115,14 @@ export function SourcePlayer({ source, ref, onReadyChange }: SourcePlayerProps) 
   useEffect(() => {
     onReadyChange?.(ready);
   }, [ready, onReadyChange]);
+
+  // A hidden project (under «Налаштування») must not go on playing, with no way to stop it.
+  const viewActive = useViewActive();
+  useEffect(() => {
+    if (!viewActive) {
+      videoRef.current?.pause();
+    }
+  }, [viewActive]);
 
   useEffect(() => {
     const video = videoRef.current;

@@ -4,11 +4,15 @@ import {
   DEFAULT_LAYOUT,
   LAYOUT_LIMITS,
   apiFailure,
+  isApiKey,
   parseApiCallResult,
+  parseApiKeyResult,
+  parseApiKeyStatus,
   parseApiResult,
   parseAppStatus,
   parseChooseFolderResult,
   parseGetViewStateResult,
+  parseImportTranscriptResult,
   parseImportVideoResult,
   parseLayout,
   parseOpenFolderResult,
@@ -447,5 +451,131 @@ describe('parseSaveViewStateResult', () => {
     { ok: true, data: { saved: false } },
   ])('rejects %j', (value) => {
     expect(() => parseSaveViewStateResult(value)).toThrow(TypeError);
+  });
+});
+
+describe('isApiKey', () => {
+  it('accepts 20 to 200 printable ASCII characters without a space', () => {
+    expect(isApiKey('k'.repeat(20))).toBe(true);
+    expect(isApiKey('k'.repeat(200))).toBe(true);
+    expect(isApiKey('sk-or-v1-0123456789abcdef!~')).toBe(true);
+  });
+
+  it.each([
+    ['too short', 'k'.repeat(19)],
+    ['too long', 'k'.repeat(201)],
+    ['a space inside', `${'k'.repeat(10)} ${'k'.repeat(10)}`],
+    ['a trailing newline', `${'k'.repeat(20)}\n`],
+    ['a tab', `${'k'.repeat(20)}\t`],
+    ['a non-ASCII letter', `${'k'.repeat(19)}є`],
+    ['a number', 1234],
+    ['null', null],
+    ['an empty string', ''],
+  ])('refuses %s', (_name, value) => {
+    expect(isApiKey(value)).toBe(false);
+  });
+});
+
+describe('parseApiKeyStatus', () => {
+  it('keeps the state and the message and drops every other key', () => {
+    expect(parseApiKeyStatus({ state: 'protected', message: null, key: 'k'.repeat(30) })).toEqual({
+      state: 'protected',
+      message: null,
+    });
+    expect(parseApiKeyStatus({ state: 'none', message: 'Не вдалося прочитати' })).toEqual({
+      state: 'none',
+      message: 'Не вдалося прочитати',
+    });
+  });
+
+  it.each([
+    undefined,
+    null,
+    [],
+    {},
+    { state: 'protected' },
+    { state: 'unknown', message: null },
+    { state: 'session', message: 5 },
+    { state: 'session', message: 'x'.repeat(501) },
+  ])('rejects %j', (value) => {
+    expect(() => parseApiKeyStatus(value)).toThrow(TypeError);
+  });
+});
+
+describe('parseImportTranscriptResult (ADR 039)', () => {
+  const REVISION = {
+    id: ID,
+    source_id: ID,
+    revision: 1,
+    origin: 'import',
+    run_id: null,
+    parent_id: null,
+    timing_level: 'segment',
+    language: 'uk',
+    duration_ms: 12000,
+    word_count: 0,
+    segment_count: 1,
+    coverage: [{ start_ms: 0, end_ms: 12000, state: 'succeeded' }],
+    created_at: '2026-11-16T10:00:00Z',
+  };
+
+  it('accepts a cancel, a revision and an error, and drops every other key', () => {
+    expect(parseImportTranscriptResult({ canceled: true, path: 'C:\\x.srt' })).toEqual({
+      canceled: true,
+    });
+    expect(
+      parseImportTranscriptResult({
+        ok: true,
+        data: { ...REVISION, metadata: { provider: 'import' }, text: '1\n', path: 'C:\\x.srt' },
+      }),
+    ).toEqual({ ok: true, data: REVISION });
+    expect(
+      parseImportTranscriptResult(
+        apiFailure('TRANSCRIPT_FILE_UNREADABLE', 'Не вдалося прочитати файл субтитрів'),
+      ),
+    ).toEqual({
+      ok: false,
+      error: {
+        code: 'TRANSCRIPT_FILE_UNREADABLE',
+        message: 'Не вдалося прочитати файл субтитрів',
+        retryable: false,
+      },
+    });
+  });
+
+  it.each([
+    undefined,
+    null,
+    'canceled',
+    { canceled: false },
+    { canceled: 'true' },
+    { ok: true, data: { id: ID } },
+    { ok: true, data: { ...REVISION, revision: -1 } },
+    { ok: true, data: { ...REVISION, coverage: 'all' } },
+    { ok: true },
+  ])('rejects %j', (value) => {
+    expect(() => parseImportTranscriptResult(value)).toThrow(TypeError);
+  });
+
+  it('names its channel when the answer has no shape of its own', () => {
+    expect(() => parseImportTranscriptResult(undefined)).toThrow('dialog:import-transcript');
+    expect(() => parseImportTranscriptResult({ canceled: 'yes' })).toThrow(
+      'dialog:import-transcript',
+    );
+  });
+});
+
+describe('parseApiKeyResult', () => {
+  it('accepts a status and an error, and names the channel it was asked for', () => {
+    expect(
+      parseApiKeyResult({ ok: true, data: { state: 'session', message: null, x: 1 } }, 'ch'),
+    ).toEqual({ ok: true, data: { state: 'session', message: null } });
+    expect(parseApiKeyResult(apiFailure('INVALID_API_KEY', 'Ключ має…'), 'ch')).toMatchObject({
+      ok: false,
+      error: { code: 'INVALID_API_KEY' },
+    });
+    expect(() => parseApiKeyResult({ ok: true, data: { state: 'x' } }, 'settings:set-api-key')).toThrow(
+      'settings:set-api-key',
+    );
   });
 });

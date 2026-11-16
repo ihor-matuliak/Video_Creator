@@ -137,6 +137,135 @@ describe('buildPlan: every op maps to one fixed method and path', () => {
     ],
     ['previews.get', { id: ID }, { method: 'GET', path: `/v1/previews/${ID}` }],
     ['system.checks', {}, { method: 'GET', path: '/v1/system/checks' }],
+    ['settings.get', {}, { method: 'GET', path: '/v1/settings' }],
+    [
+      'settings.update',
+      { stt_model: 'google/gemini-3.5-transcribe', stt_language: null, run_budget_usd: '2.50' },
+      {
+        method: 'PATCH',
+        path: '/v1/settings',
+        body: { stt_model: 'google/gemini-3.5-transcribe', stt_language: null, run_budget_usd: '2.50' },
+      },
+    ],
+    ['settings.update', {}, { method: 'PATCH', path: '/v1/settings', body: {} }],
+    ['jobs.resume', { id: ID }, { method: 'POST', path: `/v1/jobs/${ID}/resume`, body: {} }],
+    [
+      'jobs.resume',
+      { id: ID, retry_unknown: true },
+      { method: 'POST', path: `/v1/jobs/${ID}/resume`, body: { retry_unknown: true } },
+    ],
+    [
+      'jobs.resume',
+      { id: ID, retry_unknown: false },
+      { method: 'POST', path: `/v1/jobs/${ID}/resume`, body: { retry_unknown: false } },
+    ],
+    [
+      'transcription.estimate',
+      { source_id: ID, audio_stream_index: 1 },
+      {
+        method: 'POST',
+        path: '/v1/transcription-runs/estimate',
+        body: { source_id: ID, audio_stream_index: 1 },
+      },
+    ],
+    [
+      'transcription.create',
+      { source_id: ID, audio_stream_index: 2 },
+      {
+        method: 'POST',
+        path: '/v1/transcription-runs',
+        body: { source_id: ID, audio_stream_index: 2 },
+      },
+    ],
+    [
+      'transcription.create',
+      { source_id: ID, audio_stream_index: 2, force: true },
+      {
+        method: 'POST',
+        path: '/v1/transcription-runs',
+        body: { source_id: ID, audio_stream_index: 2, force: true },
+      },
+    ],
+    [
+      'transcription.create',
+      { source_id: ID, audio_stream_index: 0, force: false },
+      {
+        method: 'POST',
+        path: '/v1/transcription-runs',
+        body: { source_id: ID, audio_stream_index: 0, force: false },
+      },
+    ],
+    ['transcription.get', { id: ID }, { method: 'GET', path: `/v1/transcription-runs/${ID}` }],
+    [
+      'transcription.list',
+      { source_id: ID },
+      { method: 'GET', path: `/v1/transcription-runs?source_id=${ID}` },
+    ],
+    [
+      'jobs.resume',
+      { id: ID, budget_usd: '5.00' },
+      { method: 'POST', path: `/v1/jobs/${ID}/resume`, body: { budget_usd: '5.00' } },
+    ],
+    [
+      'jobs.resume',
+      { id: ID, retry_unknown: true, budget_usd: '1000' },
+      {
+        method: 'POST',
+        path: `/v1/jobs/${ID}/resume`,
+        body: { retry_unknown: true, budget_usd: '1000' },
+      },
+    ],
+    [
+      'jobs.resume',
+      { id: ID, budget_usd: '0.01' },
+      { method: 'POST', path: `/v1/jobs/${ID}/resume`, body: { budget_usd: '0.01' } },
+    ],
+    [
+      'transcripts.list',
+      { source_id: ID },
+      { method: 'GET', path: `/v1/transcripts?source_id=${ID}` },
+    ],
+    [
+      'transcripts.list',
+      { source_id: ID, cursor: 'c1' },
+      { method: 'GET', path: `/v1/transcripts?source_id=${ID}&cursor=c1` },
+    ],
+    ['transcripts.get', { id: ID }, { method: 'GET', path: `/v1/transcripts/${ID}` }],
+    [
+      'transcripts.get',
+      { id: ID, offset: 0, limit: 1 },
+      { method: 'GET', path: `/v1/transcripts/${ID}?offset=0&limit=1` },
+    ],
+    [
+      'transcripts.get',
+      { id: ID, offset: 1000, limit: 1000 },
+      { method: 'GET', path: `/v1/transcripts/${ID}?offset=1000&limit=1000` },
+    ],
+    [
+      'transcripts.correct',
+      {
+        id: ID,
+        edits: [
+          { word_id: 'w1', text: 'Привіт' },
+          { segment_id: 's2', text: '  Світ  ' },
+        ],
+      },
+      {
+        method: 'POST',
+        path: `/v1/transcripts/${ID}/corrections`,
+        body: {
+          edits: [
+            { word_id: 'w1', text: 'Привіт' },
+            { segment_id: 's2', text: '  Світ  ' },
+          ],
+        },
+      },
+    ],
+    [
+      'credentials.check',
+      {},
+      { method: 'POST', path: '/v1/runtime/credentials/check' },
+    ],
   ];
 
   it.each(cases)('%s %j', (op, params, expected) => {
@@ -235,8 +364,16 @@ describe('buildPlan: ids must be uuid4', () => {
     ['exports.retry', 'batch_id'],
     ['jobs.get', 'id'],
     ['jobs.cancel', 'id'],
+    ['jobs.resume', 'id'],
     ['previews.create', 'source_id'],
     ['previews.get', 'id'],
+    ['transcription.estimate', 'source_id'],
+    ['transcription.create', 'source_id'],
+    ['transcription.get', 'id'],
+    ['transcription.list', 'source_id'],
+    ['transcripts.list', 'source_id'],
+    ['transcripts.get', 'id'],
+    ['transcripts.correct', 'id'],
   ];
   const valid: Readonly<Record<string, unknown>> = {
     'projects.update': { id: ID },
@@ -248,8 +385,16 @@ describe('buildPlan: ids must be uuid4', () => {
     'exports.retry': { batch_id: ID },
     'jobs.get': { id: ID },
     'jobs.cancel': { id: ID },
+    'jobs.resume': { id: ID },
     'previews.create': { source_id: ID, audio_stream_index: 1 },
     'previews.get': { id: ID },
+    'transcription.estimate': { source_id: ID, audio_stream_index: 1 },
+    'transcription.create': { source_id: ID, audio_stream_index: 1 },
+    'transcription.get': { id: ID },
+    'transcription.list': { source_id: ID },
+    'transcripts.list': { source_id: ID },
+    'transcripts.get': { id: ID },
+    'transcripts.correct': { id: ID, edits: [{ word_id: 'w1', text: 'a' }] },
   };
 
   it.each(idOps)('%s rejects a bad %s', (op, key) => {
@@ -366,6 +511,150 @@ describe('buildPlan: params of the wrong shape are rejected', () => {
     ['system.checks', 'checks'],
     ['system.checks', 5],
     ['system.checks', true],
+    ['settings.get', { extra: 1 }],
+    ['settings.get', []],
+    ['settings.update', { openrouter_api_key: 'k'.repeat(30) }],
+    ['settings.update', { has_api_key: true }],
+    ['settings.update', { theme: 'dark' }],
+    ['settings.update', { stt_model: null }],
+    ['settings.update', { stt_model: 5 }],
+    ['settings.update', { stt_language: 5 }],
+    ['settings.update', { analysis_model: false }],
+    ['settings.update', { run_budget_usd: 2.5 }],
+    ['settings.update', { run_budget_usd: 'a'.repeat(1001) }],
+    ['settings.update', { run_budget_usd: '1', extra: true }],
+    ['settings.update', []],
+    ['settings.update', 'x'],
+    ['jobs.resume', {}],
+    ['jobs.resume', undefined],
+    ['jobs.resume', null],
+    ['jobs.resume', { id: ID, retry_unknown: 'true' }],
+    ['jobs.resume', { id: ID, retry_unknown: 1 }],
+    ['jobs.resume', { id: ID, retry_unknown: null }],
+    ['jobs.resume', { id: ID, budget_usd: null }],
+    ['jobs.resume', { id: ID, budget_usd: 5 }],
+    ['jobs.resume', { id: ID, budget_usd: '' }],
+    ['jobs.resume', { id: ID, budget_usd: '0' }],
+    ['jobs.resume', { id: ID, budget_usd: '0.00' }],
+    ['jobs.resume', { id: ID, budget_usd: '0.009999' }],
+    ['jobs.resume', { id: ID, budget_usd: '1000.000001' }],
+    ['jobs.resume', { id: ID, budget_usd: '1000.0000001' }],
+    ['jobs.resume', { id: ID, budget_usd: '1001' }],
+    ['jobs.resume', { id: ID, budget_usd: '10000' }],
+    ['jobs.resume', { id: ID, budget_usd: '05' }],
+    ['jobs.resume', { id: ID, budget_usd: '1.' }],
+    ['jobs.resume', { id: ID, budget_usd: '.5' }],
+    ['jobs.resume', { id: ID, budget_usd: '+5' }],
+    ['jobs.resume', { id: ID, budget_usd: '-5' }],
+    ['jobs.resume', { id: ID, budget_usd: '1e2' }],
+    ['jobs.resume', { id: ID, budget_usd: ' 5' }],
+    ['jobs.resume', { id: ID, budget_usd: '5,00' }],
+    ['jobs.resume', { id: ID, budget_usd: 'NaN' }],
+    ['jobs.resume', { id: ID, retry_unknown: true, budget_usd: '0' }],
+    ['jobs.resume', { id: ID, budget_usd: '5', ceiling: '5' }],
+    ['jobs.resume', { id: ID, extra: true }],
+    ['jobs.resume', [{ id: ID }]],
+    ['transcription.estimate', {}],
+    ['transcription.estimate', undefined],
+    ['transcription.estimate', null],
+    ['transcription.estimate', { source_id: ID }],
+    ['transcription.estimate', { audio_stream_index: 1 }],
+    ['transcription.estimate', { source_id: ID, audio_stream_index: undefined }],
+    ['transcription.estimate', { source_id: ID, audio_stream_index: null }],
+    ['transcription.estimate', { source_id: ID, audio_stream_index: '1' }],
+    ['transcription.estimate', { source_id: ID, audio_stream_index: 1.5 }],
+    ['transcription.estimate', { source_id: ID, audio_stream_index: Number.NaN }],
+    ['transcription.estimate', { source_id: ID, audio_stream_index: Number.POSITIVE_INFINITY }],
+    ['transcription.estimate', { source_id: ID, audio_stream_index: [1] }],
+    ['transcription.estimate', { source_id: ID, audio_stream_index: 1, model: 'vendor/model' }],
+    ['transcription.estimate', { source_id: ID, audio_stream_index: 1, language: 'uk' }],
+    ['transcription.estimate', { source_id: ID, audio_stream_index: 1, budget_usd: '1.00' }],
+    ['transcription.estimate', { source_id: ID, audio_stream_index: 1, force: true }],
+    ['transcription.estimate', { source_id: ID, audio_stream_index: 1, extra: true }],
+    ['transcription.estimate', [{ source_id: ID, audio_stream_index: 1 }]],
+    ['transcription.create', {}],
+    ['transcription.create', undefined],
+    ['transcription.create', null],
+    ['transcription.create', { source_id: ID }],
+    ['transcription.create', { audio_stream_index: 1 }],
+    ['transcription.create', { source_id: ID, audio_stream_index: '1' }],
+    ['transcription.create', { source_id: ID, audio_stream_index: 1.5 }],
+    ['transcription.create', { source_id: ID, audio_stream_index: null }],
+    ['transcription.create', { source_id: ID, audio_stream_index: 1, force: 'true' }],
+    ['transcription.create', { source_id: ID, audio_stream_index: 1, force: 1 }],
+    ['transcription.create', { source_id: ID, audio_stream_index: 1, force: null }],
+    ['transcription.create', { source_id: ID, audio_stream_index: 1, model: 'vendor/model' }],
+    ['transcription.create', { source_id: ID, audio_stream_index: 1, language: 'uk' }],
+    ['transcription.create', { source_id: ID, audio_stream_index: 1, budget_usd: '1.00' }],
+    ['transcription.create', { source_id: ID, audio_stream_index: 1, openrouter_api_key: 'k' }],
+    ['transcription.create', { source_id: ID, audio_stream_index: 1, extra: true }],
+    ['transcription.create', [{ source_id: ID, audio_stream_index: 1 }]],
+    ['transcription.get', {}],
+    ['transcription.get', undefined],
+    ['transcription.get', { source_id: ID }],
+    ['transcription.get', { id: ID, extra: true }],
+    ['transcription.get', [{ id: ID }]],
+    ['transcription.list', {}],
+    ['transcription.list', undefined],
+    ['transcription.list', { id: ID }],
+    ['transcription.list', { source_id: ID, limit: 5 }],
+    ['transcription.list', { source_id: ID, cursor: 'abc' }],
+    ['transcription.list', { source_id: ID, extra: true }],
+    ['transcription.list', [{ source_id: ID }]],
+    ['transcripts.list', undefined],
+    ['transcripts.list', {}],
+    ['transcripts.list', { source_id: ID, limit: 5 }],
+    ['transcripts.list', { source_id: ID, cursor: 5 }],
+    ['transcripts.list', { source_id: ID, cursor: null }],
+    ['transcripts.list', { source_id: ID, cursor: 'a'.repeat(1001) }],
+    ['transcripts.list', { source_id: ID, id: ID }],
+    ['transcripts.list', [{ source_id: ID }]],
+    ['transcripts.get', {}],
+    ['transcripts.get', undefined],
+    ['transcripts.get', { id: ID, limit: 0 }],
+    ['transcripts.get', { id: ID, limit: 1001 }],
+    ['transcripts.get', { id: ID, limit: 1.5 }],
+    ['transcripts.get', { id: ID, limit: '200' }],
+    ['transcripts.get', { id: ID, limit: null }],
+    ['transcripts.get', { id: ID, limit: Number.NaN }],
+    ['transcripts.get', { id: ID, offset: -1 }],
+    ['transcripts.get', { id: ID, offset: 2 ** 31 }],
+    ['transcripts.get', { id: ID, offset: 0.5 }],
+    ['transcripts.get', { id: ID, offset: '0' }],
+    ['transcripts.get', { id: ID, offset: null }],
+    ['transcripts.get', { id: ID, cursor: 'x' }],
+    ['transcripts.get', { id: ID, extra: true }],
+    ['transcripts.get', [{ id: ID }]],
+    ['transcripts.correct', { id: ID }],
+    ['transcripts.correct', { id: ID, edits: [] }],
+    ['transcripts.correct', { id: ID, edits: 'w1' }],
+    ['transcripts.correct', { id: ID, edits: null }],
+    ['transcripts.correct', { id: ID, edits: {} }],
+    ['transcripts.correct', { edits: [{ word_id: 'w1', text: 'a' }] }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: 'w1', text: 'a' }], extra: 1 }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: 'w1', segment_id: 's1', text: 'a' }] }],
+    ['transcripts.correct', { id: ID, edits: [{ text: 'a' }] }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: null, text: 'a' }] }],
+    ['transcripts.correct', { id: ID, edits: [{ segment_id: null, text: 'a' }] }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: 'w1', segment_id: null, text: 'a' }] }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: 5, text: 'a' }] }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: '', text: 'a' }] }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: 'w1' }] }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: 'w1', text: undefined }] }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: 'w1', text: '' }] }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: 'w1', text: ' \n\t ' }] }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: 'w1', text: 5 }] }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: 'w1', text: 'a', start_ms: 0 }] }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: 'w1', text: 'a', speaker_local: 'S1' }] }],
+    ['transcripts.correct', { id: ID, edits: [null] }],
+    ['transcripts.correct', { id: ID, edits: ['w1'] }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: 'w1', text: 'a' }, 'x'] }],
+    ['credentials.check', undefined],
+    ['credentials.check', null],
+    ['credentials.check', []],
+    ['credentials.check', 'check'],
+    ['credentials.check', { openrouter_api_key: 'k'.repeat(30) }],
+    ['credentials.check', { id: ID }],
   ] as const)('%s %j', (op, params) => {
     expect(() => buildPlan(op, params)).toThrow(ParamError);
   });
@@ -468,6 +757,51 @@ describe('buildPlan: the renderer cannot pass a path, output_dir or evidence_typ
     expect(() =>
       buildPlan('previews.create', { source_id: ID, audio_stream_index: 1, ...extra }),
     ).toThrow(ParamError);
+    expect(() => buildPlan('jobs.resume', { id: ID, ...extra })).toThrow(ParamError);
+    expect(() =>
+      buildPlan('transcription.estimate', { source_id: ID, audio_stream_index: 1, ...extra }),
+    ).toThrow(ParamError);
+    expect(() =>
+      buildPlan('transcription.create', { source_id: ID, audio_stream_index: 1, ...extra }),
+    ).toThrow(ParamError);
+    expect(() => buildPlan('transcription.get', { id: ID, ...extra })).toThrow(ParamError);
+    expect(() => buildPlan('transcription.list', { source_id: ID, ...extra })).toThrow(ParamError);
+    expect(() => buildPlan('transcripts.list', { source_id: ID, ...extra })).toThrow(ParamError);
+    expect(() => buildPlan('transcripts.get', { id: ID, ...extra })).toThrow(ParamError);
+    expect(() =>
+      buildPlan('transcripts.correct', {
+        id: ID,
+        edits: [{ word_id: 'w1', text: 'a' }],
+        ...extra,
+      }),
+    ).toThrow(ParamError);
+    expect(() => buildPlan('credentials.check', extra)).toThrow(ParamError);
+  });
+
+  it('transcription ops send no model, language, budget or key: the backend takes them from the settings', () => {
+    const create = buildPlan('transcription.create', {
+      source_id: ID,
+      audio_stream_index: 1,
+      force: true,
+    });
+    const estimate = buildPlan('transcription.estimate', { source_id: ID, audio_stream_index: 1 });
+
+    expect(Object.keys(create.body ?? {}).sort()).toEqual([
+      'audio_stream_index',
+      'force',
+      'source_id',
+    ]);
+    expect(Object.keys(estimate.body ?? {}).sort()).toEqual(['audio_stream_index', 'source_id']);
+    expect(buildPlan('jobs.resume', { id: ID, retry_unknown: true }).body).toEqual({
+      retry_unknown: true,
+    });
+  });
+
+  it('transcription.list encodes the source id in the query and sends no body', () => {
+    const plan = buildPlan('transcription.list', { source_id: ID });
+
+    expect(plan.path).toBe(`/v1/transcription-runs?source_id=${ID}`);
+    expect(plan.body).toBeUndefined();
   });
 
   it('previews.create sends only the audio stream; the source id stays in the path', () => {
@@ -483,6 +817,191 @@ describe('buildPlan: the renderer cannot pass a path, output_dir or evidence_typ
 
     expect(() => buildPlan('sources.get', params)).toThrow(ParamError);
     expect(() => buildPlan('sources.list', listParams)).toThrow(ParamError);
+  });
+});
+
+describe('buildPlan: transcript windows and corrections (ADR 030, 039)', () => {
+  const edit = { word_id: 'w1', text: 'Привіт' };
+
+  it('transcripts.get: offset 0, limit 1 and 1000 and the largest offset are accepted', () => {
+    expect(buildPlan('transcripts.get', { id: ID, offset: 0, limit: 1 }).path).toBe(
+      `/v1/transcripts/${ID}?offset=0&limit=1`,
+    );
+    expect(buildPlan('transcripts.get', { id: ID, limit: 1000 }).path).toBe(
+      `/v1/transcripts/${ID}?limit=1000`,
+    );
+    expect(buildPlan('transcripts.get', { id: ID, offset: 2 ** 31 - 1 }).path).toBe(
+      `/v1/transcripts/${ID}?offset=2147483647`,
+    );
+  });
+
+  it('transcripts.get: without a window the path has no query, the backend keeps its defaults', () => {
+    expect(buildPlan('transcripts.get', { id: ID }).path).toBe(`/v1/transcripts/${ID}`);
+  });
+
+  it('transcripts.correct: 1 and 500 edits are accepted, 0 and 501 are refused', () => {
+    const max = Array.from({ length: 500 }, (_, index) => ({
+      segment_id: `s${String(index)}`,
+      text: 'a',
+    }));
+    const over = Array.from({ length: 501 }, (_, index) => ({
+      word_id: `w${String(index)}`,
+      text: 'a',
+    }));
+
+    expect(buildPlan('transcripts.correct', { id: ID, edits: [edit] }).body).toEqual({
+      edits: [edit],
+    });
+    expect(buildPlan('transcripts.correct', { id: ID, edits: max }).body).toEqual({ edits: max });
+    expect(() => buildPlan('transcripts.correct', { id: ID, edits: [] })).toThrow(ParamError);
+    expect(() => buildPlan('transcripts.correct', { id: ID, edits: over })).toThrow(ParamError);
+  });
+
+  it('transcripts.correct: each edit names exactly one of word_id and segment_id, neither or both is refused', () => {
+    expect(() => buildPlan('transcripts.correct', { id: ID, edits: [{ text: 'a' }] })).toThrow(
+      ParamError,
+    );
+    expect(() =>
+      buildPlan('transcripts.correct', {
+        id: ID,
+        edits: [{ word_id: 'w1', segment_id: 's1', text: 'a' }],
+      }),
+    ).toThrow(ParamError);
+    expect(() =>
+      buildPlan('transcripts.correct', {
+        id: ID,
+        edits: [{ word_id: null, segment_id: null, text: 'a' }],
+      }),
+    ).toThrow(ParamError);
+  });
+
+  it('transcripts.correct: an undefined id counts as absent, so the other id is the one sent', () => {
+    const byWord = buildPlan('transcripts.correct', {
+      id: ID,
+      edits: [{ word_id: 'w1', segment_id: undefined, text: 'a' }],
+    });
+    const bySegment = buildPlan('transcripts.correct', {
+      id: ID,
+      edits: [{ word_id: undefined, segment_id: 's1', text: 'a' }],
+    });
+
+    expect(JSON.stringify(byWord.body)).toBe('{"edits":[{"word_id":"w1","text":"a"}]}');
+    expect(JSON.stringify(bySegment.body)).toBe('{"edits":[{"segment_id":"s1","text":"a"}]}');
+  });
+
+  it('transcripts.correct: a hole, a non-object or any key besides the three is refused', () => {
+    const holey: unknown[] = [edit];
+    holey.length = 2;
+
+    expect(() => buildPlan('transcripts.correct', { id: ID, edits: holey })).toThrow(ParamError);
+    expect(() => buildPlan('transcripts.correct', { id: ID, edits: [edit, 'w2'] })).toThrow(
+      ParamError,
+    );
+    for (const extra of [
+      { start_ms: 0 },
+      { end_ms: 1 },
+      { ordinal: 2 },
+      { speaker_local: 'S1' },
+      { confidence: 1 },
+      { chunk_id: 'c1' },
+    ]) {
+      expect(() => buildPlan('transcripts.correct', { id: ID, edits: [{ ...edit, ...extra }] })).toThrow(
+        ParamError,
+      );
+    }
+  });
+
+  it('transcripts.correct: the text is sent as typed, and a blank text is refused', () => {
+    expect(
+      buildPlan('transcripts.correct', { id: ID, edits: [{ word_id: 'w1', text: '  Привіт  ' }] })
+        .body,
+    ).toEqual({ edits: [{ word_id: 'w1', text: '  Привіт  ' }] });
+    for (const text of ['', ' ', '\n\t ']) {
+      expect(() =>
+        buildPlan('transcripts.correct', { id: ID, edits: [{ word_id: 'w1', text }] }),
+      ).toThrow(ParamError);
+    }
+    expect(() =>
+      buildPlan('transcripts.correct', { id: ID, edits: [{ word_id: 'w1', text: 5 }] }),
+    ).toThrow(ParamError);
+    // A segment text can be 2000 characters; the length itself is the backend's to check.
+    expect(
+      buildPlan('transcripts.correct', {
+        id: ID,
+        edits: [{ segment_id: 's1', text: 'a'.repeat(2000) }],
+      }).body,
+    ).toEqual({ edits: [{ segment_id: 's1', text: 'a'.repeat(2000) }] });
+  });
+
+  it('transcripts.correct: word and segment IDs are the document’s own, not uuids, up to 2000 characters', () => {
+    for (const id of ['w1', 's1', 'w-0001', 'ж'.repeat(2000), '🎬'.repeat(2000)]) {
+      expect(buildPlan('transcripts.correct', { id: ID, edits: [{ word_id: id, text: 'a' }] }).body)
+        .toEqual({ edits: [{ word_id: id, text: 'a' }] });
+    }
+    for (const id of ['', 'a'.repeat(2001), '🎬'.repeat(2001), 5, null, ['w1'], { toString: () => 'w1' }]) {
+      expect(() => buildPlan('transcripts.correct', { id: ID, edits: [{ word_id: id, text: 'a' }] })).toThrow(
+        ParamError,
+      );
+      expect(() =>
+        buildPlan('transcripts.correct', { id: ID, edits: [{ segment_id: id, text: 'a' }] }),
+      ).toThrow(ParamError);
+    }
+  });
+});
+
+describe('buildPlan: credentials.check (ADR 039)', () => {
+  it('posts with no params and no body, and the path holds no key', () => {
+    const plan = buildPlan('credentials.check', {});
+
+    expect(plan).toEqual({ method: 'POST', path: '/v1/runtime/credentials/check' });
+    expect(plan.body).toBeUndefined();
+  });
+
+  it('refuses a key or any other param, so no key can ride along', () => {
+    for (const params of [
+      { openrouter_api_key: 'k'.repeat(30) },
+      { key: 'k'.repeat(30) },
+      { path: 'C:\\keys.txt' },
+      { id: ID },
+    ]) {
+      expect(() => buildPlan('credentials.check', params)).toThrow(ParamError);
+    }
+  });
+});
+
+describe('buildPlan: jobs.resume budget_usd (ADR 038, доповнення 2)', () => {
+  it.each(['0.01', '1', '2.50', '999.999999', '1000', '1000.000000'])(
+    'accepts %s as the run ceiling and sends it as typed',
+    (budget) => {
+      expect(buildPlan('jobs.resume', { id: ID, budget_usd: budget }).body).toEqual({
+        budget_usd: budget,
+      });
+    },
+  );
+
+  it.each(['0', '0.00', '0.009999', '1000.000001', '1000.0000001', '1001', '01', '1.', '.5', '+5', '-5', '1e2', ' 5', '5 ', '5,00', 'NaN', 'Infinity', ''])(
+    'refuses %j, the settings rule of run_budget_usd',
+    (budget) => {
+      expect(() => buildPlan('jobs.resume', { id: ID, budget_usd: budget })).toThrow(ParamError);
+    },
+  );
+
+  // One-element rows: vitest would spread an array given as a bare case into the arguments.
+  it.each([[null], [5], [2.5], [true], [[]], [{}]])(
+    'refuses %j: a number or null is not a budget, an absent one is a missing key',
+    (budget) => {
+      expect(() => buildPlan('jobs.resume', { id: ID, budget_usd: budget })).toThrow(ParamError);
+    },
+  );
+
+  it('sends the decision and the budget together, and an undefined budget as absent', () => {
+    expect(
+      buildPlan('jobs.resume', { id: ID, retry_unknown: false, budget_usd: '2.5' }).body,
+    ).toEqual({ retry_unknown: false, budget_usd: '2.5' });
+    expect(buildPlan('jobs.resume', { id: ID, budget_usd: undefined }).body).toEqual({});
+    expect(buildPlan('jobs.resume', { id: ID, budget_usd: '5' }).path).toBe(
+      `/v1/jobs/${ID}/resume`,
+    );
   });
 });
 

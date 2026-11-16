@@ -1,22 +1,23 @@
 import { useId } from 'react';
 import type { ReactNode, Ref } from 'react';
 
-export type DetailsTabId = 'edit' | 'keys';
+export type DetailsTabId = 'edit' | 'keys' | 'transcript';
 
 const TAB_LABELS: Readonly<Record<DetailsTabId, string>> = {
   edit: 'Межі',
   keys: 'Клавіші',
+  transcript: 'Транскрипція',
 };
 
-const TAB_ORDER: readonly DetailsTabId[] = ['edit', 'keys'];
+const TAB_ORDER: readonly DetailsTabId[] = ['edit', 'keys', 'transcript'];
 
 export interface DetailsPanelProps {
   /** `id` of the panel; the splitter that resizes it points at it. */
   readonly id: string;
   readonly ref?: Ref<HTMLElement>;
   /**
-   * Below 1440 px the panel sits under the player and its two parts are tabs (docs/03 section
-   * 8); from 1440 px it is the right column and both parts are shown.
+   * Below 1440 px the panel sits under the player and its parts are tabs (docs/03 section
+   * 8); from 1440 px it is the right column and all of its parts are shown.
    */
   readonly tabbed: boolean;
   readonly active: DetailsTabId;
@@ -25,6 +26,8 @@ export interface DetailsPanelProps {
   readonly edit: ReactNode;
   /** The keyboard shortcuts. */
   readonly keys: ReactNode;
+  /** The transcript of the source of the clips (ADR 039). */
+  readonly transcript: ReactNode;
 }
 
 /**
@@ -32,11 +35,11 @@ export interface DetailsPanelProps {
  * place in the tree, so a window that crosses 1440 px does not remount the fields: what was
  * typed stays. A part that is not shown is only hidden, never unmounted.
  */
-export function DetailsPanel({ id, ref, tabbed, active, onChange, edit, keys }: DetailsPanelProps) {
+export function DetailsPanel({ id, ref, tabbed, active, onChange, edit, keys, transcript }: DetailsPanelProps) {
   const ids = useId();
   const tabId = (tab: DetailsTabId): string => `${ids}-tab-${tab}`;
   const panelId = (tab: DetailsTabId): string => `${ids}-panel-${tab}`;
-  const content: Readonly<Record<DetailsTabId, ReactNode>> = { edit, keys };
+  const content: Readonly<Record<DetailsTabId, ReactNode>> = { edit, keys, transcript };
 
   return (
     <aside

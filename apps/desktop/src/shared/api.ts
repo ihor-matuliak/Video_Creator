@@ -20,9 +20,20 @@ export const API_OPS = [
   'exports.retry',
   'jobs.get',
   'jobs.cancel',
+  'jobs.resume',
   'previews.create',
   'previews.get',
   'system.checks',
+  'settings.get',
+  'settings.update',
+  'transcription.estimate',
+  'transcription.create',
+  'transcription.get',
+  'transcription.list',
+  'transcripts.list',
+  'transcripts.get',
+  'transcripts.correct',
+  'credentials.check',
 ] as const;
 
 export type ApiOp = (typeof API_OPS)[number];
@@ -131,6 +142,17 @@ export interface ApiParams {
   readonly 'exports.retry': { readonly batch_id: string };
   readonly 'jobs.get': { readonly id: string };
   readonly 'jobs.cancel': { readonly id: string };
+  /**
+   * Continues an interrupted, failed or cancelled job (ADR 038). `retry_unknown` is the user's
+   * explicit decision to send again the requests whose outcome is unknown; they may already have
+   * been paid for. `budget_usd` replaces the run's ceiling (ADR 038, доповнення 2): a decimal string
+   * under the rule of `run_budget_usd`. Nothing else is accepted.
+   */
+  readonly 'jobs.resume': {
+    readonly id: string;
+    readonly retry_unknown?: boolean;
+    readonly budget_usd?: string;
+  };
   readonly 'previews.create': {
     readonly source_id: string;
     /** Global source stream index of the audio to keep; null for a proxy without sound. */
@@ -139,7 +161,71 @@ export interface ApiParams {
   readonly 'previews.get': { readonly id: string };
   /** Readiness of FFmpeg, FFprobe and the data folder (ADR 023, ADR 024); takes no params. */
   readonly 'system.checks': Readonly<Record<string, never>>;
+  /** The four non-secret settings and whether the sidecar holds a key (ADR 033); no params. */
+  readonly 'settings.get': Readonly<Record<string, never>>;
+  /**
+   * Only the keys that are present change; `null` resets a setting to its default, except
+   * `stt_model`, which has an explicit default and cannot be null. The values are checked by the
+   * backend (422 with a code). The API key is not a setting: it goes through `setApiKey`.
+   */
+  readonly 'settings.update': {
+    readonly stt_model?: string;
+    readonly stt_language?: string | null;
+    readonly analysis_model?: string | null;
+    readonly run_budget_usd?: string | null;
+  };
+  /**
+   * What a speech-recognition run of one audio track would cost (ADR 037, 038). The model, the
+   * language and the budget are not params: the backend takes them from the settings. Nothing is
+   * written or sent to the provider.
+   */
+  readonly 'transcription.estimate': {
+    readonly source_id: string;
+    /** Global source stream index of the audio track. */
+    readonly audio_stream_index: number;
+  };
+  /**
+   * Starts a run. `force` confirms a second, paid run over a transcript that already exists
+   * (without it that is 409 TRANSCRIPT_ALREADY_EXISTS).
+   */
+  readonly 'transcription.create': {
+    readonly source_id: string;
+    readonly audio_stream_index: number;
+    readonly force?: boolean;
+  };
+  readonly 'transcription.get': { readonly id: string };
+  /** All runs of one source, the newest first. */
+  readonly 'transcription.list': { readonly source_id: string };
+  /**
+   * The revisions of one source, oldest first (ADR 039). The renderer follows `next_cursor` until
+   * it is null; the page size is the backend's.
+   */
+  readonly 'transcripts.list': { readonly source_id: string; readonly cursor?: string };
+  /**
+   * One revision with a window of its segments and words (ADR 030, 039). `offset` is 0 or more,
+   * `limit` 1 to 1000 (the backend's default is 200).
+   */
+  readonly 'transcripts.get': {
+    readonly id: string;
+    readonly offset?: number;
+    readonly limit?: number;
+  };
+  /**
+   * A correction of text (FR-020, ADR 039): a new revision with the edits applied. Each edit names
+   * one word or one segment of the revision, never both and never neither.
+   */
+  readonly 'transcripts.correct': { readonly id: string; readonly edits: readonly TranscriptEdit[] };
+  /**
+   * Checks the key that the sidecar holds, with OpenRouter (ADR 039). Takes no params: the key
+   * never leaves the sidecar and is not in any op.
+   */
+  readonly 'credentials.check': Readonly<Record<string, never>>;
 }
+
+/** One correction: the ID of a word or of a segment, and the text it gets. */
+export type TranscriptEdit =
+  | { readonly word_id: string; readonly text: string }
+  | { readonly segment_id: string; readonly text: string };
 
 export interface Page<T> {
   readonly items: readonly T[];
@@ -337,6 +423,177 @@ export interface SystemChecksDto {
   readonly data_dir: DataDirCheckDto;
 }
 
+/**
+ * The settings of GET and PATCH /v1/settings (ADR 033). `has_api_key` only says that the sidecar
+ * holds a key; no answer ever carries the key itself.
+ */
+export interface SettingsDto {
+  readonly stt_model: string;
+  readonly stt_language: string | null;
+  readonly analysis_model: string | null;
+  /** A decimal string such as "2.50", kept as the user wrote it; null: no ceiling is set. */
+  readonly run_budget_usd: string | null;
+  readonly has_api_key: boolean;
+}
+
+/** The transcript a run would repeat: an earlier completed run with the same model and options. */
+export interface ExistingTranscriptDto {
+  readonly transcript_id: string;
+  readonly run_id: string;
+}
+
+/**
+ * The answer of POST /v1/transcription-runs/estimate (ADR 037). The sum is an upper estimate of
+ * one attempt per part; retries and splits can add to it, so it is not a bound on the bill.
+ */
+export interface TranscriptionEstimateDto {
+  readonly source_id: string;
+  readonly audio_stream_index: number;
+  readonly model: string;
+  /** null: the language is detected by the provider. */
+  readonly language: string | null;
+  readonly duration_ms: number;
+  readonly chunk_count: number;
+  readonly billed_seconds: number;
+  /** A decimal string: the highest price of one billed second. */
+  readonly usd_per_second_upper: string;
+  readonly estimate_micro_usd: number;
+  readonly price_basis: string;
+  /** A decimal string such as "2.50"; null: no ceiling is set in the settings. */
+  readonly budget_usd: string | null;
+  /** null when there is no budget to compare with. */
+  readonly within_budget: boolean | null;
+  readonly existing: ExistingTranscriptDto | null;
+}
+
+export interface TranscriptionCreatedDto {
+  readonly id: string;
+  readonly job_id: string;
+  readonly status: string;
+}
+
+export interface TranscriptionChunkDto {
+  readonly id: string;
+  readonly core_start_ms: number;
+  readonly core_end_ms: number;
+  /**
+   * pending, running, succeeded, failed, cancelled, unknown_outcome or superseded (split in two
+   * parts); kept as a string, like the other states, so a new one does not break the answer.
+   */
+  readonly state: string;
+  readonly attempts: number;
+  readonly error_code: string | null;
+}
+
+/** A run in a list: its figures without the parts. */
+export interface TranscriptionRunItemDto {
+  readonly id: string;
+  readonly source_id: string;
+  readonly job_id: string | null;
+  readonly model: string;
+  readonly status: string;
+  /** The transcript revision the run produced; null until it is complete. */
+  readonly revision_id: string | null;
+  readonly error_code: string | null;
+  readonly committed_micro_usd: number;
+  readonly created_at: string;
+}
+
+export interface TranscriptionRunDto {
+  readonly id: string;
+  readonly source_id: string;
+  readonly job_id: string | null;
+  readonly model: string;
+  readonly status: string;
+  readonly revision_id: string | null;
+  readonly error_code: string | null;
+  readonly committed_micro_usd: number;
+  readonly chunks: readonly TranscriptionChunkDto[];
+}
+
+/** GET /v1/transcription-runs has no pages: the runs of one source are few. */
+export interface TranscriptionRunListDto {
+  readonly items: readonly TranscriptionRunItemDto[];
+}
+
+/** A span of the source's time with the coverage state of the transcript (ADR 030). */
+export interface TranscriptCoverageSpanDto {
+  readonly start_ms: number;
+  readonly end_ms: number;
+  /** succeeded or another state of the backend; kept as a string. */
+  readonly state: string;
+}
+
+/**
+ * One revision of a source's transcript (ADR 030, 039). `id` names the revision; `revision` counts
+ * the source's revisions from 1. The backend's `metadata` is not in this DTO.
+ */
+export interface TranscriptDto {
+  readonly id: string;
+  readonly source_id: string;
+  readonly revision: number;
+  /** import, stt or correction. */
+  readonly origin: string;
+  readonly run_id: string | null;
+  readonly parent_id: string | null;
+  /** word or segment: whether the words of the revision carry the timing. */
+  readonly timing_level: string;
+  readonly language: string;
+  readonly duration_ms: number;
+  readonly word_count: number;
+  readonly segment_count: number;
+  readonly coverage: readonly TranscriptCoverageSpanDto[];
+  readonly created_at: string;
+}
+
+export interface TranscriptSegmentDto {
+  readonly id: string;
+  readonly ordinal: number;
+  readonly start_ms: number;
+  readonly end_ms: number;
+  readonly text: string;
+  /** The IDs of the words the segment is made of; empty for a segment-level revision. */
+  readonly word_ids: readonly string[];
+  readonly timing_level: string;
+}
+
+export interface TranscriptWordDto {
+  readonly id: string;
+  readonly ordinal: number;
+  readonly start_ms: number;
+  readonly end_ms: number;
+  readonly text: string;
+  readonly chunk_id: string | null;
+  readonly speaker_local: string | null;
+  /** The provider's own figure; not a calibrated probability (CLAUDE.md). */
+  readonly confidence: number | null;
+}
+
+/**
+ * A revision with one window of its segments and words. `next_offset` is the offset of the next
+ * window, or null when neither list has more.
+ */
+export interface TranscriptDetailDto extends TranscriptDto {
+  readonly offset: number;
+  readonly limit: number;
+  readonly next_offset: number | null;
+  readonly segments: readonly TranscriptSegmentDto[];
+  readonly words: readonly TranscriptWordDto[];
+}
+
+/**
+ * The answer of the key check (ADR 039). `valid` also says whether the account is on the free tier
+ * and what is left of its limit: null when there is no limit. `invalid` means OpenRouter refused
+ * the key; nothing else is said.
+ */
+export type CredentialCheckDto =
+  | {
+      readonly state: 'valid';
+      readonly is_free_tier: boolean;
+      readonly limit_remaining_usd: string | null;
+    }
+  | { readonly state: 'invalid' };
+
 export interface ApiData {
   readonly 'projects.list': Page<ProjectListItemDto>;
   readonly 'projects.create': ProjectDto;
@@ -352,9 +609,20 @@ export interface ApiData {
   readonly 'exports.retry': ExportCreatedDto;
   readonly 'jobs.get': JobDto;
   readonly 'jobs.cancel': JobDto;
+  readonly 'jobs.resume': JobDto;
   readonly 'previews.create': PreviewCreatedDto;
   readonly 'previews.get': PreviewDto;
   readonly 'system.checks': SystemChecksDto;
+  readonly 'settings.get': SettingsDto;
+  readonly 'settings.update': SettingsDto;
+  readonly 'transcription.estimate': TranscriptionEstimateDto;
+  readonly 'transcription.create': TranscriptionCreatedDto;
+  readonly 'transcription.get': TranscriptionRunDto;
+  readonly 'transcription.list': TranscriptionRunListDto;
+  readonly 'transcripts.list': Page<TranscriptDto>;
+  readonly 'transcripts.get': TranscriptDetailDto;
+  readonly 'transcripts.correct': TranscriptDto;
+  readonly 'credentials.check': CredentialCheckDto;
 }
 
 type Parse<T> = (value: unknown) => T;
@@ -643,6 +911,199 @@ const parseSystemChecks: Parse<SystemChecksDto> = (value) => {
   };
 };
 
+/** Exactly the five fields of the settings answer; any other key is dropped. */
+export const parseSettings: Parse<SettingsDto> = (value) => {
+  const source = record(value);
+  return {
+    stt_model: field(source, 'stt_model', text),
+    stt_language: field(source, 'stt_language', nullable(text)),
+    analysis_model: field(source, 'analysis_model', nullable(text)),
+    run_budget_usd: field(source, 'run_budget_usd', nullable(text)),
+    has_api_key: field(source, 'has_api_key', bool),
+  };
+};
+
+const parseExistingTranscript: Parse<ExistingTranscriptDto> = (value) => {
+  const source = record(value);
+  return {
+    transcript_id: field(source, 'transcript_id', text),
+    run_id: field(source, 'run_id', text),
+  };
+};
+
+const parseTranscriptionEstimate: Parse<TranscriptionEstimateDto> = (value) => {
+  const source = record(value);
+  return {
+    source_id: field(source, 'source_id', text),
+    audio_stream_index: field(source, 'audio_stream_index', integer),
+    model: field(source, 'model', text),
+    language: field(source, 'language', nullable(text)),
+    duration_ms: field(source, 'duration_ms', count),
+    chunk_count: field(source, 'chunk_count', count),
+    billed_seconds: field(source, 'billed_seconds', count),
+    usd_per_second_upper: field(source, 'usd_per_second_upper', text),
+    estimate_micro_usd: field(source, 'estimate_micro_usd', count),
+    price_basis: field(source, 'price_basis', text),
+    budget_usd: field(source, 'budget_usd', nullable(text)),
+    within_budget: field(source, 'within_budget', nullable(bool)),
+    existing: field(source, 'existing', nullable(parseExistingTranscript)),
+  };
+};
+
+const parseTranscriptionCreated: Parse<TranscriptionCreatedDto> = (value) => {
+  const source = record(value);
+  return {
+    id: field(source, 'id', text),
+    job_id: field(source, 'job_id', text),
+    status: field(source, 'status', text),
+  };
+};
+
+const parseTranscriptionChunk: Parse<TranscriptionChunkDto> = (value) => {
+  const source = record(value);
+  return {
+    id: field(source, 'id', text),
+    core_start_ms: field(source, 'core_start_ms', count),
+    core_end_ms: field(source, 'core_end_ms', count),
+    state: field(source, 'state', text),
+    attempts: field(source, 'attempts', count),
+    error_code: field(source, 'error_code', nullable(text)),
+  };
+};
+
+/** The fields a run has in a list and in its own answer. */
+function transcriptionRunFields(source: Fields): Omit<TranscriptionRunItemDto, 'created_at'> {
+  return {
+    id: field(source, 'id', text),
+    source_id: field(source, 'source_id', text),
+    job_id: field(source, 'job_id', nullable(text)),
+    model: field(source, 'model', text),
+    status: field(source, 'status', text),
+    revision_id: field(source, 'revision_id', nullable(text)),
+    error_code: field(source, 'error_code', nullable(text)),
+    committed_micro_usd: field(source, 'committed_micro_usd', count),
+  };
+}
+
+const parseTranscriptionRun: Parse<TranscriptionRunDto> = (value) => {
+  const source = record(value);
+  return {
+    ...transcriptionRunFields(source),
+    chunks: field(source, 'chunks', list(parseTranscriptionChunk)),
+  };
+};
+
+const parseTranscriptionRunItem: Parse<TranscriptionRunItemDto> = (value) => {
+  const source = record(value);
+  return {
+    ...transcriptionRunFields(source),
+    created_at: field(source, 'created_at', text),
+  };
+};
+
+const parseTranscriptionRunList: Parse<TranscriptionRunListDto> = (value) => ({
+  items: field(record(value), 'items', list(parseTranscriptionRunItem)),
+});
+
+const parseCoverageSpan: Parse<TranscriptCoverageSpanDto> = (value) => {
+  const source = record(value);
+  return {
+    start_ms: field(source, 'start_ms', integer),
+    end_ms: field(source, 'end_ms', integer),
+    state: field(source, 'state', text),
+  };
+};
+
+/**
+ * A revision as the backend answers. Only the fields of `TranscriptDto` are kept: the backend's
+ * `metadata` and any other key are dropped.
+ */
+export const parseTranscript: Parse<TranscriptDto> = (value) => {
+  const source = record(value);
+  return {
+    id: field(source, 'id', text),
+    source_id: field(source, 'source_id', text),
+    revision: field(source, 'revision', count),
+    origin: field(source, 'origin', text),
+    run_id: field(source, 'run_id', nullable(text)),
+    parent_id: field(source, 'parent_id', nullable(text)),
+    timing_level: field(source, 'timing_level', text),
+    language: field(source, 'language', text),
+    duration_ms: field(source, 'duration_ms', count),
+    word_count: field(source, 'word_count', count),
+    segment_count: field(source, 'segment_count', count),
+    coverage: field(source, 'coverage', list(parseCoverageSpan)),
+    created_at: field(source, 'created_at', text),
+  };
+};
+
+const parseSegment: Parse<TranscriptSegmentDto> = (value) => {
+  const source = record(value);
+  return {
+    id: field(source, 'id', text),
+    ordinal: field(source, 'ordinal', count),
+    start_ms: field(source, 'start_ms', integer),
+    end_ms: field(source, 'end_ms', integer),
+    text: field(source, 'text', text),
+    word_ids: field(source, 'word_ids', list(text)),
+    timing_level: field(source, 'timing_level', text),
+  };
+};
+
+const parseConfidence: Parse<number> = (value) =>
+  typeof value === 'number' && Number.isFinite(value) ? value : bad();
+
+const parseWord: Parse<TranscriptWordDto> = (value) => {
+  const source = record(value);
+  return {
+    id: field(source, 'id', text),
+    ordinal: field(source, 'ordinal', count),
+    start_ms: field(source, 'start_ms', integer),
+    end_ms: field(source, 'end_ms', integer),
+    text: field(source, 'text', text),
+    chunk_id: field(source, 'chunk_id', nullable(text)),
+    speaker_local: field(source, 'speaker_local', nullable(text)),
+    confidence: field(source, 'confidence', nullable(parseConfidence)),
+  };
+};
+
+/** A window of a revision: the revision fields plus `offset`, `limit`, `next_offset` and the items. */
+const parseTranscriptDetail: Parse<TranscriptDetailDto> = (value) => {
+  const source = record(value);
+  return {
+    ...parseTranscript(source),
+    offset: field(source, 'offset', count),
+    limit: field(source, 'limit', count),
+    next_offset: field(source, 'next_offset', nullable(count)),
+    segments: field(source, 'segments', list(parseSegment)),
+    words: field(source, 'words', list(parseWord)),
+  };
+};
+
+const parseCredentialState: Parse<'valid' | 'invalid'> = (value) =>
+  value === 'valid' || value === 'invalid' ? value : bad();
+
+/** A plain decimal string: an optional minus, digits, an optional fraction. No exponent, plus or spaces. */
+const DECIMAL_TEXT = /^-?\d+(\.\d+)?$/;
+const decimalText: Parse<string> = (value) =>
+  typeof value === 'string' && DECIMAL_TEXT.test(value) ? value : bad();
+
+/**
+ * The key check answer. `invalid` keeps no other field; `valid` needs its free-tier flag and its
+ * remaining limit (null when there is none, else a plain decimal string). Any other key is dropped.
+ */
+const parseCredentialCheck: Parse<CredentialCheckDto> = (value) => {
+  const source = record(value);
+  if (field(source, 'state', parseCredentialState) === 'invalid') {
+    return { state: 'invalid' };
+  }
+  return {
+    state: 'valid',
+    is_free_tier: field(source, 'is_free_tier', bool),
+    limit_remaining_usd: field(source, 'limit_remaining_usd', nullable(decimalText)),
+  };
+};
+
 /** Parser of the `data` of a successful result, per op. */
 export const API_DATA_PARSERS: { readonly [O in ApiOp]: Parse<ApiData[O]> } = {
   'projects.list': parsePage(parseProjectListItem),
@@ -659,7 +1120,18 @@ export const API_DATA_PARSERS: { readonly [O in ApiOp]: Parse<ApiData[O]> } = {
   'exports.retry': parseExportCreated,
   'jobs.get': parseJob,
   'jobs.cancel': parseJob,
+  'jobs.resume': parseJob,
   'previews.create': parsePreviewCreated,
   'previews.get': parsePreview,
   'system.checks': parseSystemChecks,
+  'settings.get': parseSettings,
+  'settings.update': parseSettings,
+  'transcription.estimate': parseTranscriptionEstimate,
+  'transcription.create': parseTranscriptionCreated,
+  'transcription.get': parseTranscriptionRun,
+  'transcription.list': parseTranscriptionRunList,
+  'transcripts.list': parsePage(parseTranscript),
+  'transcripts.get': parseTranscriptDetail,
+  'transcripts.correct': parseTranscript,
+  'credentials.check': parseCredentialCheck,
 };

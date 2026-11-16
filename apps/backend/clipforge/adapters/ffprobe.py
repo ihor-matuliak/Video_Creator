@@ -296,24 +296,37 @@ def _video_end_pts(
     # No stream duration (Matroska): read packets from the last keyframe to the end.
     # The seek target only has to be at or after the last keyframe, so the container
     # end estimate may overshoot.
-    options = ["-select_streams", str(video_index)]
+    base_options = ["-select_streams", str(video_index)]
+    seek_options: list[str] = []
     container_start = _fraction(container.get("start_time")) or Fraction(0)
     container_duration = _fraction(container.get("duration"))
     if container_duration is not None and container_start + container_duration > 0:
         target = float(container_start + container_duration)
-        options += ["-read_intervals", f"{target:.6f}%"]
-    options += ["-show_entries", "packet=pts,duration,flags"]
-    packets = _list(_run_json(ffprobe, options, source, timeout_s).get("packets"))
+        seek_options = ["-read_intervals", f"{target:.6f}%"]
+    ends = _packet_ends(ffprobe, source, [*base_options, *seek_options], timeout_s)
+    if not ends and seek_options:
+        # Seen in tests on Windows (ffprobe 8.1, cause not found): this seek to the end of a
+        # Matroska file sometimes yields no packets with exit code 0; read the stream once more.
+        ends = _packet_ends(ffprobe, source, base_options, timeout_s)
+    if not ends:
+        raise SourceUnreadableError("Не вдалося визначити тривалість відео")
+    return max(ends)
+
+
+def _packet_ends(
+    ffprobe: Path, source: Path, options: Sequence[str], timeout_s: float
+) -> list[int]:
+    """``pts + duration`` of every usable packet (discarded or untimed ones are left out)."""
+    show = ["-show_entries", "packet=pts,duration,flags"]
+    document = _run_json(ffprobe, [*options, *show], source, timeout_s)
     ends: list[int] = []
-    for item in packets:
+    for item in _list(document.get("packets")):
         packet = _obj(item)
         pts = _int(packet.get("pts"))
         if pts is None or "D" in (_str(packet.get("flags")) or ""):
             continue
         ends.append(pts + max(_int(packet.get("duration")) or 0, 0))
-    if not ends:
-        raise SourceUnreadableError("Не вдалося визначити тривалість відео")
-    return max(ends)
+    return ends
 
 
 def _frame_timing(

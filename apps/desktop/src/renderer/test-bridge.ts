@@ -9,15 +9,19 @@ import type {
   ClipDto,
   ProjectDto,
   ProjectListItemDto,
+  SettingsDto,
   SourceDto,
   SystemChecksDto,
 } from '../shared/api';
 import type {
+  ApiKeyStatus,
   ApiResult,
   AppStatus,
   ChooseFolderResult,
   ClipforgeBridge,
   FolderOpened,
+  ImportTranscriptParams,
+  ImportTranscriptResult,
   ImportVideoParams,
   ImportVideoResult,
   OpenFolderParams,
@@ -125,19 +129,24 @@ export interface InstalledBridge {
   /** Every `bridge.call`, with the op and params as the renderer passed them. */
   readonly call: Mock<RecordedCall>;
   readonly importVideo: Mock<ClipforgeBridge['importVideo']>;
+  readonly importTranscript: Mock<ClipforgeBridge['importTranscript']>;
   readonly pickVideo: Mock<ClipforgeBridge['pickVideo']>;
   readonly takeDroppedVideo: Mock<ClipforgeBridge['takeDroppedVideo']>;
   readonly chooseExportFolder: Mock<ClipforgeBridge['chooseExportFolder']>;
   readonly openExportFolder: Mock<ClipforgeBridge['openExportFolder']>;
   readonly getViewState: Mock<ClipforgeBridge['getViewState']>;
   readonly setViewState: Mock<ClipforgeBridge['setViewState']>;
+  readonly setApiKey: Mock<ClipforgeBridge['setApiKey']>;
+  readonly forgetApiKey: Mock<ClipforgeBridge['forgetApiKey']>;
+  readonly getApiKeyStatus: Mock<ClipforgeBridge['getApiKeyStatus']>;
 }
 
 export interface BridgeOptions {
   readonly getStatus?: ClipforgeBridge['getStatus'];
   /**
-   * Ops without a handler reject, like an IPC call that main refused. The exception is
-   * `sources.list`, which answers an empty project unless a test gives it a handler.
+   * Ops without a handler reject, like an IPC call that main refused. The exceptions are
+   * `sources.list`, which answers an empty project, and `transcripts.list`, which answers a source
+   * without a transcript (ADR 039); a test gives either one a handler to answer otherwise.
    */
   readonly handlers?: ApiHandlers;
   /** The state file as the previous run left it; without it nothing is remembered. */
@@ -145,6 +154,10 @@ export interface BridgeOptions {
   /** Replaces the read of the remembered state (to reject, or to answer late). */
   readonly getViewState?: () => ViewState | null | Promise<ViewState | null>;
   readonly importVideo?: (params: ImportVideoParams) => ImportVideoResult | Promise<ImportVideoResult>;
+  /** The native subtitle picker; without a handler the user cancels it. */
+  readonly importTranscript?: (
+    params: ImportTranscriptParams,
+  ) => ImportTranscriptResult | Promise<ImportTranscriptResult>;
   /** The native video picker; without a handler the user cancels it. */
   readonly pickVideo?: () => PickVideoResult | Promise<PickVideoResult>;
   /** Without a handler the call rejects, like an IPC call that main refused. */
@@ -155,6 +168,44 @@ export interface BridgeOptions {
   readonly openExportFolder?: (
     params: OpenFolderParams,
   ) => ApiResult<FolderOpened> | Promise<ApiResult<FolderOpened>>;
+  /** How main keeps the key at the start; without it there is none. */
+  readonly apiKey?: ApiKeyStatus;
+  /** Replaces the read of the key status (to reject, or to answer late). */
+  readonly getApiKeyStatus?: () => ApiKeyStatus | Promise<ApiKeyStatus>;
+  /**
+   * Replaces the save of the key. Without it the key is kept as `protected`; the fake never
+   * answers the key itself.
+   */
+  readonly setApiKey?: (key: string) => ApiResult<ApiKeyStatus> | Promise<ApiResult<ApiKeyStatus>>;
+  /** Replaces the removal of the key. Without it the key becomes `none`. */
+  readonly forgetApiKey?: () => ApiResult<ApiKeyStatus> | Promise<ApiResult<ApiKeyStatus>>;
+}
+
+/** How main reports it when there is no key. */
+export const NO_KEY: ApiKeyStatus = { state: 'none', message: null };
+
+/** A request the test answers by hand: to hold it on its way, or to answer it late. */
+export function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
+  let settle: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((done) => {
+    settle = done;
+  });
+  return {
+    promise,
+    resolve: (value) => {
+      settle(value);
+    },
+  };
+}
+
+/**
+ * One turn of the event loop, so that an answer the test has just resolved reaches the screen. Use it
+ * inside `act`, after the resolve: the answer goes through several promises before the screen shows it.
+ */
+export async function flushAnswers(): Promise<void> {
+  await new Promise((done) => {
+    setTimeout(done, 0);
+  });
 }
 
 /** A well-formed one-time folder token, for tests. */
@@ -173,10 +224,23 @@ export function makeChecks(overrides: Partial<SystemChecksDto> = {}): SystemChec
   };
 }
 
+/** The settings of a fresh installation: the default model, nothing else set, no key. */
+export function makeSettings(overrides: Partial<SettingsDto> = {}): SettingsDto {
+  return {
+    stt_model: 'microsoft/mai-transcribe-2',
+    stt_language: null,
+    analysis_model: null,
+    run_budget_usd: null,
+    has_api_key: false,
+    ...overrides,
+  };
+}
+
 /** Puts a fake bridge on `window.clipforge`; the setup file removes it after each test. */
 export function installBridge(options: BridgeOptions = {}): InstalledBridge {
   const handlers: ApiHandlers = {
     'sources.list': () => ok({ items: [], next_cursor: null }),
+    'transcripts.list': () => ok({ items: [], next_cursor: null }),
     ...options.handlers,
   };
   const call = vi.fn<RecordedCall>(async (op, params) => {
@@ -192,6 +256,12 @@ export function installBridge(options: BridgeOptions = {}): InstalledBridge {
     }
     return await options.importVideo(params);
   });
+  const importTranscript = vi.fn(
+    async (params: ImportTranscriptParams): Promise<ImportTranscriptResult> =>
+      options.importTranscript === undefined
+        ? { canceled: true }
+        : await options.importTranscript(params),
+  );
   const pickVideo = vi.fn(
     async (): Promise<PickVideoResult> =>
       options.pickVideo === undefined ? { canceled: true } : await options.pickVideo(),
@@ -222,30 +292,61 @@ export function installBridge(options: BridgeOptions = {}): InstalledBridge {
     remembered = state;
     return Promise.resolve(ok({ saved: true as const }));
   });
+  // Like main: what was last saved is what the next read returns.
+  let keyStatus: ApiKeyStatus = options.apiKey ?? NO_KEY;
+  const getApiKeyStatus = vi.fn(
+    async (): Promise<ApiKeyStatus> =>
+      options.getApiKeyStatus === undefined ? keyStatus : await options.getApiKeyStatus(),
+  );
+  const setApiKey = vi.fn(async (key: string): Promise<ApiResult<ApiKeyStatus>> => {
+    const answer =
+      options.setApiKey === undefined
+        ? ok<ApiKeyStatus>({ state: 'protected', message: null })
+        : await options.setApiKey(key);
+    if (answer.ok) {
+      keyStatus = answer.data;
+    }
+    return answer;
+  });
+  const forgetApiKey = vi.fn(async (): Promise<ApiResult<ApiKeyStatus>> => {
+    const answer = options.forgetApiKey === undefined ? ok(NO_KEY) : await options.forgetApiKey();
+    if (answer.ok) {
+      keyStatus = answer.data;
+    }
+    return answer;
+  });
   const bridge: ClipforgeBridge = {
     bridgeVersion: 2,
     getStatus: options.getStatus ?? (() => Promise.resolve(READY)),
     // The fake answers whatever the handler returns; the real bridge validates per op.
     call: ((op, params) => call(op, params)) as ClipforgeBridge['call'],
     importVideo,
+    importTranscript,
     pickVideo,
     takeDroppedVideo,
     chooseExportFolder,
     openExportFolder,
     getViewState,
     setViewState,
+    setApiKey,
+    forgetApiKey,
+    getApiKeyStatus,
   };
   Object.defineProperty(window, 'clipforge', { value: bridge, configurable: true });
   return {
     bridge,
     call,
     importVideo,
+    importTranscript,
     pickVideo,
     takeDroppedVideo,
     chooseExportFolder,
     openExportFolder,
     getViewState,
     setViewState,
+    setApiKey,
+    forgetApiKey,
+    getApiKeyStatus,
   };
 }
 

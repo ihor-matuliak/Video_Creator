@@ -1,9 +1,10 @@
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { app, BrowserWindow, dialog, ipcMain, protocol, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, protocol, safeStorage, shell } from 'electron';
 
 import { APP_GET_STATUS_CHANNEL } from '../shared/bridge';
+import { ApiKeyService, registerApiKeyIpc } from './api-key';
 import { ApiGateway, registerApiIpc } from './api-gateway';
 import { isTrustedSender } from './ipc-guard';
 import type { TrustedPage } from './ipc-guard';
@@ -30,6 +31,19 @@ const sidecar = new Sidecar({
   pythonPath: join(REPO_ROOT, '.venv', 'Scripts', 'python.exe'),
   cwd: join(REPO_ROOT, 'apps', 'backend'),
   env: process.env,
+});
+
+// The OpenRouter key (ADR 034): encrypted in the workspace folder, given to the backend on every
+// `ready` of the sidecar, and never handed to the renderer. `safeStorage` is passed as the object
+// itself so that a replaced method (E2E) is picked up at call time.
+const apiKeys = new ApiKeyService({
+  dataDir,
+  storage: safeStorage,
+  backend: sidecar,
+  backendRunning: () => sidecar.getStatus().state === 'ready',
+});
+sidecar.onReady(() => {
+  void apiKeys.syncToBackend();
 });
 
 let trustedPage: TrustedPage | null = null;
@@ -68,8 +82,9 @@ app.on('web-contents-created', (_event, contents) => {
   });
 });
 
-// The only handler: status of the backend, and only for the app's own page.
-ipcMain.handle(APP_GET_STATUS_CHANNEL, (event) => {
+// Status of the backend, and only for the app's own page. `ready` is reported once the key held by
+// main has been given to the backend, so the settings the renderer reads then are consistent.
+ipcMain.handle(APP_GET_STATUS_CHANNEL, async (event) => {
   const frame = event.senderFrame;
   const allowed = isTrustedSender(
     {
@@ -82,11 +97,15 @@ ipcMain.handle(APP_GET_STATUS_CHANNEL, (event) => {
   if (!allowed) {
     throw new Error('Недозволений відправник IPC');
   }
-  return sidecar.getStatus();
+  const status = sidecar.getStatus();
+  if (status.state === 'ready') {
+    await apiKeys.settled();
+  }
+  return status;
 });
 
-// The renderer's only route to the backend: api:call, dialog:import-video, dialog:pick-video,
-// drop:video, export:choose-folder and export:open-folder. Each handler checks the sender; the
+// The renderer's only route to the backend: api:call, dialog:import-video, dialog:import-transcript,
+// dialog:pick-video, drop:video, export:choose-folder and export:open-folder. Each handler checks the sender; the
 // session token and port never leave `sidecar`. `dialog` is passed as the object
 // itself so that a replaced `dialog.showOpenDialog` (E2E) is picked up at call time.
 registerApiIpc(
@@ -102,6 +121,9 @@ registerApiIpc(
 
 // The project and tab shown last, so a restart reopens them (docs/03 section 12).
 registerViewStateIpc(ipcMain, new ViewStateStore(dataDir), () => trustedPage);
+
+// settings:set-api-key, settings:forget-api-key and settings:get-api-key-status.
+registerApiKeyIpc(ipcMain, apiKeys, () => trustedPage);
 
 function createMainWindow(): void {
   const window = new BrowserWindow({

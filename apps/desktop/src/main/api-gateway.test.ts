@@ -1,8 +1,11 @@
 // @vitest-environment node
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
+import type { Stats } from 'node:fs';
+import { open, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
+import type * as fsPromises from 'node:fs/promises';
 import type { BrowserWindow, IpcMainInvokeEvent } from 'electron';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -12,6 +15,13 @@ import { ApiGateway, registerApiIpc, toIpcSender } from './api-gateway';
 import type { ApiBackend, IpcRegistry, OpenDialogHost, OpenPathHost } from './api-gateway';
 import type { IpcSender, TrustedPage } from './ipc-guard';
 import { jsonResponse, startReadySidecar, stopAllSidecars, PORT } from './sidecar-test-harness';
+
+// The real module, with `open` and `stat` as spies: the subtitle tests see whether a file was
+// opened at all, and can hand back a file handle or a `stat` answer of their own.
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof fsPromises>();
+  return { ...actual, open: vi.fn(actual.open), stat: vi.fn(actual.stat) };
+});
 
 const PAGE = 'file:///C:/app/out/renderer/index.html';
 const TRUSTED: TrustedPage = { webContentsId: 7, pageUrl: PAGE };
@@ -84,6 +94,79 @@ const SOURCE_RAW = {
   created_at: '2026-11-14T10:00:00Z',
   hash_job_id: ID,
 };
+/** What GET /v1/transcripts answers per revision (ADR 039): `metadata` is the backend's own dump. */
+const TRANSCRIPT = {
+  id: ID,
+  source_id: ID2,
+  revision: 2,
+  origin: 'correction',
+  run_id: null,
+  parent_id: ID2,
+  timing_level: 'word',
+  language: 'uk',
+  duration_ms: 125_000,
+  word_count: 2,
+  segment_count: 1,
+  coverage: [{ start_ms: 0, end_ms: 125_000, state: 'succeeded' }],
+  metadata: { provider: 'openrouter', options_hash: 'x' },
+  created_at: '2026-11-16T10:00:00Z',
+};
+/** The same revision as main answers it: `metadata` is gone. */
+const TRANSCRIPT_DTO = {
+  id: ID,
+  source_id: ID2,
+  revision: 2,
+  origin: 'correction',
+  run_id: null,
+  parent_id: ID2,
+  timing_level: 'word',
+  language: 'uk',
+  duration_ms: 125_000,
+  word_count: 2,
+  segment_count: 1,
+  coverage: [{ start_ms: 0, end_ms: 125_000, state: 'succeeded' }],
+  created_at: '2026-11-16T10:00:00Z',
+};
+const TRANSCRIPT_WORDS = [
+  {
+    id: 'w1',
+    ordinal: 0,
+    start_ms: 0,
+    end_ms: 400,
+    text: 'Привіт',
+    chunk_id: ID,
+    speaker_local: null,
+    confidence: 0.91,
+  },
+  {
+    id: 'w2',
+    ordinal: 1,
+    start_ms: 400,
+    end_ms: 900,
+    text: 'світ',
+    chunk_id: ID,
+    speaker_local: null,
+    confidence: null,
+  },
+];
+const TRANSCRIPT_SEGMENT = {
+  id: 's1',
+  ordinal: 0,
+  start_ms: 0,
+  end_ms: 900,
+  text: 'Привіт світ',
+  word_ids: ['w1', 'w2'],
+  timing_level: 'word',
+};
+/** What GET /v1/transcripts/{id} answers: the revision, a window, and `metadata` again. */
+const TRANSCRIPT_WINDOW = {
+  ...TRANSCRIPT,
+  offset: 0,
+  limit: 200,
+  next_offset: null,
+  segments: [TRANSCRIPT_SEGMENT],
+  words: TRANSCRIPT_WORDS,
+};
 const CREATED = { id: ID, job_id: ID2, status: 'queued' };
 const PREVIEW = {
   id: ID,
@@ -97,6 +180,61 @@ const CHECKS = {
   ffmpeg: { ok: true, version: '8.0.1' },
   ffprobe: { ok: true, version: '8.0.1' },
   data_dir: { ok: true, free_bytes: 123_456_789_012 },
+};
+const SETTINGS = {
+  stt_model: 'microsoft/mai-transcribe-2',
+  stt_language: null,
+  analysis_model: null,
+  run_budget_usd: '2.50',
+  has_api_key: true,
+};
+/** What POST /v1/transcription-runs/estimate answers (ADR 037). */
+const ESTIMATE = {
+  source_id: ID,
+  audio_stream_index: 1,
+  model: 'microsoft/mai-transcribe-2',
+  language: null,
+  duration_ms: 125_000,
+  chunk_count: 1,
+  billed_seconds: 125,
+  usd_per_second_upper: '0.0001',
+  estimate_micro_usd: 12_500,
+  price_basis: 'upper_bound_per_second',
+  budget_usd: '2.50',
+  within_budget: true,
+  existing: null,
+};
+const TRANSCRIPTION_ITEM = {
+  id: ID,
+  source_id: ID2,
+  job_id: ID,
+  model: 'microsoft/mai-transcribe-2',
+  status: 'partial',
+  revision_id: null,
+  error_code: 'TRANSCRIPTION_PARTIAL',
+  committed_micro_usd: 12_500,
+  created_at: '2026-11-16T10:00:00Z',
+};
+/** What GET /v1/transcription-runs/{id} answers: the item without `created_at`, plus the parts. */
+const TRANSCRIPTION_RUN = {
+  id: ID,
+  source_id: ID2,
+  job_id: ID,
+  model: 'microsoft/mai-transcribe-2',
+  status: 'partial',
+  revision_id: null,
+  error_code: 'TRANSCRIPTION_PARTIAL',
+  committed_micro_usd: 12_500,
+  chunks: [
+    {
+      id: ID2,
+      core_start_ms: 0,
+      core_end_ms: 125_000,
+      state: 'unknown_outcome',
+      attempts: 1,
+      error_code: 'STT_UNKNOWN_OUTCOME',
+    },
+  ],
 };
 
 afterEach(async () => {
@@ -154,7 +292,8 @@ describe('api:call allowlist', () => {
     for (const op of [
       'projects.delete',
       'sources.create',
-      'settings.get',
+      'settings.delete',
+      'settings.credentials',
       'runtime.credentials',
       'projects.list ',
       'PROJECTS.LIST',
@@ -212,9 +351,20 @@ describe('api:call allowlist', () => {
       'exports.retry': CREATED,
       'jobs.get': JOB,
       'jobs.cancel': JOB,
+      'jobs.resume': JOB,
       'previews.create': CREATED,
       'previews.get': PREVIEW,
       'system.checks': { ...CHECKS, extra: 'x' },
+      'settings.get': SETTINGS,
+      'settings.update': SETTINGS,
+      'transcription.estimate': ESTIMATE,
+      'transcription.create': CREATED,
+      'transcription.get': TRANSCRIPTION_RUN,
+      'transcription.list': { items: [TRANSCRIPTION_ITEM] },
+      'transcripts.list': { items: [TRANSCRIPT], next_cursor: null },
+      'transcripts.get': TRANSCRIPT_WINDOW,
+      'transcripts.correct': TRANSCRIPT,
+      'credentials.check': { state: 'valid', is_free_tier: false, limit_remaining_usd: '4.25' },
     };
     const params: Readonly<Record<ApiOp, unknown>> = {
       'projects.list': {},
@@ -231,9 +381,20 @@ describe('api:call allowlist', () => {
       'exports.retry': { batch_id: ID },
       'jobs.get': { id: ID },
       'jobs.cancel': { id: ID },
+      'jobs.resume': { id: ID },
       'previews.create': { source_id: ID, audio_stream_index: 1 },
       'previews.get': { id: ID },
       'system.checks': {},
+      'settings.get': {},
+      'settings.update': { run_budget_usd: '2.50' },
+      'transcription.estimate': { source_id: ID, audio_stream_index: 1 },
+      'transcription.create': { source_id: ID, audio_stream_index: 1 },
+      'transcription.get': { id: ID },
+      'transcription.list': { source_id: ID },
+      'transcripts.list': { source_id: ID2 },
+      'transcripts.get': { id: ID, offset: 0, limit: 200 },
+      'transcripts.correct': { id: ID, edits: [{ word_id: 'w1', text: 'Привіт' }] },
+      'credentials.check': {},
     };
     const { gateway, request, showOpenDialog } = setup();
     const folder = await (async () => {
@@ -271,9 +432,20 @@ describe('api:call allowlist', () => {
       'POST /v1/export-batches',
       `GET /v1/jobs/${ID}`,
       `POST /v1/jobs/${ID}/cancel`,
+      `POST /v1/jobs/${ID}/resume`,
       `POST /v1/sources/${ID}/previews`,
       `GET /v1/previews/${ID}`,
       'GET /v1/system/checks',
+      'GET /v1/settings',
+      'PATCH /v1/settings',
+      'POST /v1/transcription-runs/estimate',
+      'POST /v1/transcription-runs',
+      `GET /v1/transcription-runs/${ID}`,
+      `GET /v1/transcription-runs?source_id=${ID}`,
+      `GET /v1/transcripts?source_id=${ID2}`,
+      `GET /v1/transcripts/${ID}?offset=0&limit=200`,
+      `POST /v1/transcripts/${ID}/corrections`,
+      'POST /v1/runtime/credentials/check',
     ]);
   });
 
@@ -372,7 +544,11 @@ describe('api:call params', () => {
     ['exports.get', {}],
     ['jobs.get', {}],
     ['jobs.cancel', {}],
+    ['jobs.resume', {}],
     ['previews.get', {}],
+    ['transcription.get', {}],
+    ['transcripts.get', {}],
+    ['transcripts.correct', { edits: [{ word_id: 'w1', text: 'a' }] }],
   ];
 
   it.each(withId)('%s: a non-uuid id is rejected without a sidecar call', async (op, rest) => {
@@ -722,6 +898,9 @@ describe('untrusted senders', () => {
     await expect(gateway.openExportFolder(sender, { batch_id: ID })).rejects.toThrow(
       'Недозволений відправник IPC',
     );
+    await expect(gateway.importTranscript(sender, { source_id: ID2 })).rejects.toThrow(
+      'Недозволений відправник IPC',
+    );
     expect(request).not.toHaveBeenCalled();
     expect(showOpenDialog).not.toHaveBeenCalled();
     expect(openPath).not.toHaveBeenCalled();
@@ -734,6 +913,7 @@ describe('untrusted senders', () => {
     await expect(gateway.importVideo(SENDER, { project_id: ID })).rejects.toThrow();
     await expect(gateway.pickVideo(SENDER)).rejects.toThrow();
     await expect(gateway.takeDroppedVideo(SENDER, { path: PICKED_VIDEO })).rejects.toThrow();
+    await expect(gateway.importTranscript(SENDER, { source_id: ID2 })).rejects.toThrow();
     await expect(gateway.chooseExportFolder(SENDER)).rejects.toThrow();
     await expect(gateway.openExportFolder(SENDER, { batch_id: ID })).rejects.toThrow();
     expect(request).not.toHaveBeenCalled();
@@ -753,6 +933,9 @@ describe('untrusted senders', () => {
       'Недозволений відправник IPC',
     );
     await expect(gateway.openExportFolder(sender, 'garbage')).rejects.toThrow(
+      'Недозволений відправник IPC',
+    );
+    await expect(gateway.importTranscript(sender, 'garbage')).rejects.toThrow(
       'Недозволений відправник IPC',
     );
   });
@@ -803,9 +986,10 @@ describe('registerApiIpc', () => {
     return { handlers, request };
   }
 
-  it('registers exactly the six gateway channels', () => {
+  it('registers exactly the seven gateway channels', () => {
     expect([...register().handlers.keys()].sort()).toEqual([
       'api:call',
+      'dialog:import-transcript',
       'dialog:import-video',
       'dialog:pick-video',
       'drop:video',
@@ -825,6 +1009,7 @@ describe('registerApiIpc', () => {
       ['api:call', { op: 'projects.list', params: {} }],
       ['dialog:import-video', { project_id: ID }],
       ['dialog:import-video', { project_id: ID, file_token: 'ab'.repeat(32) }],
+      ['dialog:import-transcript', { source_id: ID2 }],
       ['dialog:pick-video', undefined],
       ['drop:video', { path: PICKED_VIDEO }],
       ['export:choose-folder', undefined],
@@ -835,6 +1020,20 @@ describe('registerApiIpc', () => {
       );
     }
     expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes dialog:import-transcript to the gateway, which checks the sender itself', async () => {
+    const { handlers, request } = register();
+
+    // The test dialog picks a .mp4: the gateway answers the format before any file is read.
+    expect(await handlers.get('dialog:import-transcript')?.(event(7), { source_id: ID2 })).toMatchObject({
+      ok: false,
+      error: { code: 'TRANSCRIPT_FILE_UNSUPPORTED' },
+    });
+    await expect(
+      Promise.resolve().then(() => handlers.get('dialog:import-transcript')?.(event(99), { source_id: ID2 })),
+    ).rejects.toThrow('Недозволений відправник IPC');
+    expect(request).not.toHaveBeenCalled();
   });
 
   it('toIpcSender marks only the top frame as main', () => {
@@ -955,6 +1154,469 @@ describe('dialog:import-video', () => {
 
     await expect(gateway.importVideo(SENDER, { project_id: ID })).rejects.toThrow('dialog failed');
     expect(await gateway.importVideo(SENDER, { project_id: ID })).toMatchObject({ ok: true });
+  });
+});
+
+describe('dialog:import-transcript (ADR 039)', () => {
+  const MAX_SUBTITLE_BYTES = 20 * 1024 * 1024;
+  const UNREADABLE = {
+    ok: false,
+    error: {
+      code: 'TRANSCRIPT_FILE_UNREADABLE',
+      message: 'Не вдалося прочитати файл субтитрів',
+      retryable: false,
+    },
+  };
+  let sandbox: string;
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), 'clipforge-subtitles-'));
+    vi.mocked(open).mockClear();
+    vi.mocked(stat).mockClear();
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  /** Writes a file of the sandbox and makes the next dialog pick it; returns its path. */
+  function pick(h: Harness, name: string, content: string | Buffer = 'x'): string {
+    const file = join(sandbox, name);
+    writeFileSync(file, content);
+    h.showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [file] });
+    return file;
+  }
+
+  const hidesPath = (result: unknown, file: string): void => {
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain(file.replaceAll('\\', '\\\\'));
+    expect(serialized).not.toContain(sandbox.replaceAll('\\', '\\\\'));
+  };
+
+  it('opens the subtitle picker, then posts the text with the source and the offset', async () => {
+    const h = setup();
+    const text = '1\n00:00:00,000 --> 00:00:01,000\nПривіт\n';
+    pick(h, 'lines.srt', text);
+    h.request.mockResolvedValueOnce({ ok: true, data: TRANSCRIPT });
+
+    const result = await h.gateway.importTranscript(SENDER, { source_id: ID2, offset_ms: 1500 });
+
+    expect(h.showOpenDialog).toHaveBeenCalledTimes(1);
+    const [window, options] = h.showOpenDialog.mock.calls[0] ?? [];
+    expect(window).toBe(WINDOW);
+    expect(options).toEqual({
+      title: 'Імпорт субтитрів',
+      properties: ['openFile'],
+      filters: [{ name: 'Субтитри', extensions: ['srt', 'vtt'] }],
+    });
+    expect(h.request.mock.calls).toEqual([
+      [
+        'POST',
+        '/v1/transcripts/import',
+        { source_id: ID2, format: 'srt', text, offset_ms: 1500 },
+      ],
+    ]);
+    expect(result).toEqual({ ok: true, data: TRANSCRIPT_DTO });
+  });
+
+  it('takes the format from the extension in any letter case, and offset 0 when none is given', async () => {
+    const h = setup();
+    h.request.mockResolvedValue({ ok: true, data: TRANSCRIPT });
+
+    for (const [name, format] of [
+      ['one.SRT', 'srt'],
+      ['two.Vtt', 'vtt'],
+      ['three.VTT', 'vtt'],
+      ['four.srt', 'srt'],
+    ] as const) {
+      pick(h, name, 'x');
+      await h.gateway.importTranscript(SENDER, { source_id: ID2 });
+      expect(h.request).toHaveBeenLastCalledWith('POST', '/v1/transcripts/import', {
+        source_id: ID2,
+        format,
+        text: 'x',
+        offset_ms: 0,
+      });
+    }
+  });
+
+  it('answers {canceled:true} and reads nothing when the user cancels', async () => {
+    const h = setup();
+    h.showOpenDialog.mockResolvedValueOnce({ canceled: true, filePaths: [] });
+
+    expect(await h.gateway.importTranscript(SENDER, { source_id: ID2 })).toEqual({ canceled: true });
+    expect(open).not.toHaveBeenCalled();
+    expect(h.request).not.toHaveBeenCalled();
+  });
+
+  it('refuses a file over 20 MB by its size, before any of it is read', async () => {
+    const h = setup();
+    const file = join(sandbox, 'long.srt');
+    writeFileSync(file, '');
+    truncateSync(file, MAX_SUBTITLE_BYTES + 1);
+    h.showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [file] });
+
+    const result = await h.gateway.importTranscript(SENDER, { source_id: ID2 });
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'TRANSCRIPT_FILE_TOO_LARGE',
+        message: 'Файл субтитрів більший за 20 МБ',
+        retryable: false,
+      },
+    });
+    expect(open).not.toHaveBeenCalled();
+    expect(h.request).not.toHaveBeenCalled();
+    hidesPath(result, file);
+  });
+
+  it('refuses a file that grows past 20 MB after stat, and reads no byte past the limit', async () => {
+    const h = setup();
+    const file = pick(h, 'grows.srt', 'x');
+    // `stat` saw a small file; the handle then holds more than the limit.
+    vi.mocked(stat).mockResolvedValueOnce({ isFile: () => true, size: 1024 } as unknown as Stats);
+    const close = vi.fn().mockResolvedValue(undefined);
+    const read = vi.fn((buffer: Buffer, offset: number, length: number) => {
+      buffer.fill(0x20, offset, offset + length);
+      return Promise.resolve({ bytesRead: length, buffer });
+    });
+    vi.mocked(open).mockResolvedValueOnce({ read, close } as unknown as fsPromises.FileHandle);
+
+    const result = await h.gateway.importTranscript(SENDER, { source_id: ID2 });
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'TRANSCRIPT_FILE_TOO_LARGE',
+        message: 'Файл субтитрів більший за 20 МБ',
+        retryable: false,
+      },
+    });
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(read).toHaveBeenCalledWith(expect.any(Buffer), 0, MAX_SUBTITLE_BYTES + 1, 0);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(h.request).not.toHaveBeenCalled();
+    hidesPath(result, file);
+  });
+
+  it('reads a file of exactly 20 MB, then refuses its text as over the character limit', async () => {
+    const h = setup();
+    pick(h, 'exact.srt', Buffer.alloc(MAX_SUBTITLE_BYTES, 0x20));
+
+    // The byte limit is inclusive, so the file is read. Its 20 MB of text has over 5 000 000
+    // characters, so the text limit refuses it and nothing is posted.
+    expect(await h.gateway.importTranscript(SENDER, { source_id: ID2 })).toEqual({
+      ok: false,
+      error: {
+        code: 'TRANSCRIPT_FILE_TOO_LARGE',
+        message: 'Файл субтитрів містить понад 5 000 000 символів',
+        retryable: false,
+      },
+    });
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(h.request).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['5 000 001 characters of one UTF-16 unit each', 'x'.repeat(5_000_001)],
+    ['5 000 001 characters of two UTF-16 units each', '😀'.repeat(5_000_001)],
+  ])('refuses a text of over 5 000 000 code points (%s), and posts nothing', async (_name, text) => {
+    const h = setup();
+    const file = pick(h, 'long.srt', text);
+
+    const result = await h.gateway.importTranscript(SENDER, { source_id: ID2 });
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'TRANSCRIPT_FILE_TOO_LARGE',
+        message: 'Файл субтитрів містить понад 5 000 000 символів',
+        retryable: false,
+      },
+    });
+    expect(h.request).not.toHaveBeenCalled();
+    hidesPath(result, file);
+  });
+
+  it('accepts exactly 5 000 000 code points, a two-unit character counting as one', async () => {
+    const h = setup();
+    const text = '😀'.repeat(5_000_000);
+    pick(h, 'limit.srt', text);
+    h.request.mockResolvedValueOnce({ ok: true, data: TRANSCRIPT });
+
+    expect(await h.gateway.importTranscript(SENDER, { source_id: ID2 })).toEqual({
+      ok: true,
+      data: TRANSCRIPT_DTO,
+    });
+    expect(h.request).toHaveBeenCalledWith('POST', '/v1/transcripts/import', {
+      source_id: ID2,
+      format: 'srt',
+      text,
+      offset_ms: 0,
+    });
+  });
+
+  it('strips the byte order mark before the limit is counted, so a mark and 5 000 000 characters pass', async () => {
+    const h = setup();
+    const text = 'x'.repeat(5_000_000);
+    pick(h, 'mark-limit.srt', Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(text)]));
+    h.request.mockResolvedValueOnce({ ok: true, data: TRANSCRIPT });
+
+    await h.gateway.importTranscript(SENDER, { source_id: ID2 });
+
+    expect(h.request).toHaveBeenCalledWith('POST', '/v1/transcripts/import', {
+      source_id: ID2,
+      format: 'srt',
+      text,
+      offset_ms: 0,
+    });
+  });
+
+  it.each([
+    ['Windows-1251', Buffer.from([0x31, 0x0a, 0xcf, 0xf0, 0xe8, 0xe2, 0xb3, 0xf2])],
+    ['UTF-16 with a byte order mark', Buffer.from('\ufeff1\n', 'utf16le')],
+  ])('refuses a %s file without its path, and posts nothing', async (_name, bytes) => {
+    const h = setup();
+    const file = pick(h, 'bad.srt', bytes);
+
+    const result = await h.gateway.importTranscript(SENDER, { source_id: ID2 });
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'TRANSCRIPT_FILE_ENCODING',
+        message: 'Файл субтитрів не в кодуванні UTF-8',
+        retryable: false,
+      },
+    });
+    expect(h.request).not.toHaveBeenCalled();
+    hidesPath(result, file);
+  });
+
+  it('strips the byte order mark of a UTF-8 file before the text is posted', async () => {
+    const h = setup();
+    const text = 'WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n';
+    pick(h, 'bom.vtt', Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(text, 'utf8')]));
+    h.request.mockResolvedValueOnce({ ok: true, data: TRANSCRIPT });
+
+    await h.gateway.importTranscript(SENDER, { source_id: ID2 });
+
+    expect(h.request).toHaveBeenCalledWith('POST', '/v1/transcripts/import', {
+      source_id: ID2,
+      format: 'vtt',
+      text,
+      offset_ms: 0,
+    });
+  });
+
+  it('strips only the first byte order mark: a file that starts with two posts the second', async () => {
+    const h = setup();
+    const text = 'WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n';
+    const mark = Buffer.from([0xef, 0xbb, 0xbf]);
+    pick(h, 'two-marks.vtt', Buffer.concat([mark, mark, Buffer.from(text, 'utf8')]));
+    h.request.mockResolvedValueOnce({ ok: true, data: TRANSCRIPT });
+
+    await h.gateway.importTranscript(SENDER, { source_id: ID2 });
+
+    expect(h.request).toHaveBeenCalledWith('POST', '/v1/transcripts/import', {
+      source_id: ID2,
+      format: 'vtt',
+      text: `\uFEFF${text}`,
+      offset_ms: 0,
+    });
+  });
+
+  it('closes the file handle after a successful read, and posts the text it read', async () => {
+    const h = setup();
+    const text = '1\n00:00:00,000 --> 00:00:01,000\nДескриптор\n';
+    const bytes = Buffer.from(text, 'utf8');
+    pick(h, 'handle.srt', bytes);
+    // The handle serves the bytes from the position asked for, and nothing past their end.
+    const read = vi.fn((buffer: Buffer, offset: number, length: number, position: number) => {
+      const chunk = bytes.subarray(position, position + length);
+      chunk.copy(buffer, offset);
+      return Promise.resolve({ bytesRead: chunk.length, buffer });
+    });
+    const close = vi.fn().mockResolvedValue(undefined);
+    vi.mocked(open).mockResolvedValueOnce({ read, close } as unknown as fsPromises.FileHandle);
+    h.request.mockResolvedValueOnce({ ok: true, data: TRANSCRIPT });
+
+    await h.gateway.importTranscript(SENDER, { source_id: ID2 });
+
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(h.request).toHaveBeenCalledWith('POST', '/v1/transcripts/import', {
+      source_id: ID2,
+      format: 'srt',
+      text,
+      offset_ms: 0,
+    });
+  });
+
+  it('posts a UTF-8 file without a byte order mark as it is', async () => {
+    const h = setup();
+    const text = '1\n00:00:00,000 --> 00:00:01,000\nБез мітки\n';
+    pick(h, 'plain.srt', text);
+    h.request.mockResolvedValueOnce({ ok: true, data: TRANSCRIPT });
+
+    await h.gateway.importTranscript(SENDER, { source_id: ID2 });
+
+    expect(h.request).toHaveBeenCalledWith(
+      'POST',
+      '/v1/transcripts/import',
+      expect.objectContaining({ text }),
+    );
+  });
+
+  it('answers a file that is a folder or is gone with the fixed unreadable error', async () => {
+    const h = setup();
+    mkdirSync(join(sandbox, 'folder.srt'));
+    const folder = join(sandbox, 'folder.srt');
+    const gone = join(sandbox, 'gone.srt');
+    h.showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [folder] });
+    h.showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [gone] });
+
+    const folderResult = await h.gateway.importTranscript(SENDER, { source_id: ID2 });
+    const goneResult = await h.gateway.importTranscript(SENDER, { source_id: ID2 });
+
+    expect(folderResult).toEqual(UNREADABLE);
+    expect(goneResult).toEqual(UNREADABLE);
+    hidesPath(folderResult, folder);
+    hidesPath(goneResult, gone);
+    expect(h.request).not.toHaveBeenCalled();
+  });
+
+  it('does not pass on an open or read error, whose system message names the path', async () => {
+    const h = setup();
+    const file = pick(h, 'locked.srt', 'x');
+    vi.mocked(open).mockRejectedValueOnce(new Error(`EACCES: permission denied, open '${file}'`));
+
+    const refused = await h.gateway.importTranscript(SENDER, { source_id: ID2 });
+
+    expect(refused).toEqual(UNREADABLE);
+    hidesPath(refused, file);
+
+    // A read that fails: the message is dropped, and the handle is closed all the same.
+    const close = vi.fn().mockResolvedValue(undefined);
+    const read = vi.fn().mockRejectedValue(new Error(`EIO: i/o error, read '${file}'`));
+    h.showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [file] });
+    vi.mocked(open).mockResolvedValueOnce({ read, close } as unknown as fsPromises.FileHandle);
+
+    const result = await h.gateway.importTranscript(SENDER, { source_id: ID2 });
+
+    expect(result).toEqual(UNREADABLE);
+    hidesPath(result, file);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(h.request).not.toHaveBeenCalled();
+  });
+
+  it.each(['notes.txt', 'movie.mp4', 'subs.srt.bak', 'noextension', '.srt'])(
+    'refuses %s by its extension, without reading it',
+    async (name) => {
+      const h = setup();
+      pick(h, name, 'x');
+
+      expect(await h.gateway.importTranscript(SENDER, { source_id: ID2 })).toEqual({
+        ok: false,
+        error: {
+          code: 'TRANSCRIPT_FILE_UNSUPPORTED',
+          message: 'Оберіть файл субтитрів у форматі SRT або VTT',
+          retryable: false,
+        },
+      });
+      expect(open).not.toHaveBeenCalled();
+      expect(h.request).not.toHaveBeenCalled();
+    },
+  );
+
+  it('refuses bad params before the dialog opens', async () => {
+    const h = setup();
+
+    for (const payload of [
+      { source_id: '' },
+      { source_id: 'x'.repeat(201) },
+      { source_id: 'x'.repeat(200) },
+      { source_id: 'not-a-uuid' },
+      { source_id: 7 },
+      // Not uuid4: a version digit other than 4, and upper case.
+      { source_id: '0a9d7e6c-1b2f-1c3d-8e4f-5a6b7c8d9e0f' },
+      { source_id: ID2.toUpperCase() },
+      { source_id: ID2, offset_ms: 2 ** 31 },
+      { source_id: ID2, offset_ms: -(2 ** 31) },
+      { source_id: ID2, offset_ms: 1.5 },
+      { source_id: ID2, offset_ms: null },
+      { source_id: ID2, offset_ms: '1000' },
+      { source_id: ID2, path: 'C:\\x.srt' },
+      { source_id: ID2, text: '1\n' },
+      { source_id: ID2, format: 'srt' },
+      { offset_ms: 0 },
+      {},
+      'C:\\x.srt',
+      undefined,
+    ]) {
+      expect(await h.gateway.importTranscript(SENDER, payload)).toMatchObject({
+        ok: false,
+        error: { code: 'INVALID_PARAMS' },
+      });
+    }
+    expect(h.showOpenDialog).not.toHaveBeenCalled();
+    expect(h.request).not.toHaveBeenCalled();
+  });
+
+  it('accepts a uuid4 source ID and offsets of plus or minus 2^31-1', async () => {
+    const h = setup();
+    h.showOpenDialog.mockResolvedValue({ canceled: true, filePaths: [] });
+
+    for (const payload of [
+      { source_id: ID2 },
+      { source_id: ID2, offset_ms: 2 ** 31 - 1 },
+      { source_id: ID2, offset_ms: -(2 ** 31 - 1) },
+    ]) {
+      expect(await h.gateway.importTranscript(SENDER, payload)).toEqual({ canceled: true });
+    }
+    expect(h.showOpenDialog).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps the path and the text of the file out of a successful answer', async () => {
+    const h = setup();
+    const file = pick(h, 'secret-lines.srt', '1\n00:00:00,000 --> 00:00:01,000\nТаємний текст\n');
+    h.request.mockResolvedValueOnce({
+      ok: true,
+      data: { ...TRANSCRIPT, path: file, text: 'Таємний текст' },
+    });
+
+    const result = await h.gateway.importTranscript(SENDER, { source_id: ID2 });
+
+    expect(result).toEqual({ ok: true, data: TRANSCRIPT_DTO });
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain('Таємний');
+    expect(serialized).not.toContain('secret-lines');
+    hidesPath(result, file);
+    expect(serialized).not.toContain('"metadata"');
+  });
+
+  it('forwards a backend refusal, and answers a reply of another shape as a bad backend response', async () => {
+    const h = setup();
+    pick(h, 'refused.srt', 'x');
+    h.request.mockResolvedValueOnce({
+      ok: false,
+      error: { code: 'SOURCE_NOT_FOUND', message: 'Джерело не знайдено', retryable: false },
+    });
+    expect(await h.gateway.importTranscript(SENDER, { source_id: ID2 })).toEqual({
+      ok: false,
+      error: { code: 'SOURCE_NOT_FOUND', message: 'Джерело не знайдено', retryable: false },
+    });
+
+    pick(h, 'odd.srt', 'x');
+    h.request.mockResolvedValueOnce({ ok: true, data: { id: ID } });
+    expect(await h.gateway.importTranscript(SENDER, { source_id: ID2 })).toEqual({
+      ok: false,
+      error: {
+        code: 'BAD_BACKEND_RESPONSE',
+        message: 'Локальний рушій повернув неочікувану відповідь',
+        retryable: false,
+      },
+    });
   });
 });
 
@@ -2125,6 +2787,394 @@ describe('system.checks (ADR 024)', () => {
       gateway.call({ ...SENDER, webContentsId: 8 }, { op: 'system.checks', params: {} }),
     ).rejects.toThrow('Недозволений відправник IPC');
     expect(request).not.toHaveBeenCalled();
+  });
+});
+
+describe('settings.get and settings.update (ADR 033)', () => {
+  it('settings.get reads GET /v1/settings and answers exactly the five fields', async () => {
+    const { gateway, request } = setup();
+    request.mockResolvedValueOnce({ ok: true, data: { ...SETTINGS, openrouter_api_key: 'x'.repeat(30) } });
+
+    const result = await gateway.call(SENDER, { op: 'settings.get', params: {} });
+
+    expect(request.mock.calls).toEqual([['GET', '/v1/settings', undefined]]);
+    expect(result).toEqual({ ok: true, data: SETTINGS });
+    expect(JSON.stringify(result)).not.toContain('xxxxxxxx');
+  });
+
+  it('settings.update patches only the keys that were given, null included', async () => {
+    const { gateway, request } = setup();
+    request.mockResolvedValue({ ok: true, data: SETTINGS });
+
+    await gateway.call(SENDER, { op: 'settings.update', params: { run_budget_usd: null } });
+    await gateway.call(SENDER, {
+      op: 'settings.update',
+      params: {
+        stt_model: 'google/gemini-3.5-transcribe',
+        stt_language: 'es',
+        analysis_model: 'vendor/model',
+        run_budget_usd: '1.5',
+      },
+    });
+    await gateway.call(SENDER, { op: 'settings.update', params: {} });
+
+    expect(request.mock.calls).toEqual([
+      ['PATCH', '/v1/settings', { run_budget_usd: null }],
+      [
+        'PATCH',
+        '/v1/settings',
+        {
+          stt_model: 'google/gemini-3.5-transcribe',
+          stt_language: 'es',
+          analysis_model: 'vendor/model',
+          run_budget_usd: '1.5',
+        },
+      ],
+      ['PATCH', '/v1/settings', {}],
+    ]);
+  });
+
+  it.each([
+    ['the API key', { openrouter_api_key: 'k'.repeat(30) }],
+    ['a has_api_key flag', { has_api_key: true }],
+    ['an unknown setting', { theme: 'dark' }],
+    ['a null model of recognition', { stt_model: null }],
+    ['a number as the budget', { run_budget_usd: 2.5 }],
+    ['a number as the language', { stt_language: 5 }],
+    ['a list', []],
+    ['a string', 'x'],
+  ])('settings.update refuses %s without calling the sidecar', async (_name, params) => {
+    const { gateway, request } = setup();
+
+    expect(await gateway.call(SENDER, { op: 'settings.update', params })).toMatchObject({
+      ok: false,
+      error: { code: 'INVALID_PARAMS' },
+    });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('settings.get refuses params', async () => {
+    const { gateway, request } = setup();
+
+    expect(await gateway.call(SENDER, { op: 'settings.get', params: { x: 1 } })).toMatchObject({
+      ok: false,
+      error: { code: 'INVALID_PARAMS' },
+    });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('forwards a 422 of the backend with its code', async () => {
+    const { gateway, request } = setup();
+    request.mockResolvedValueOnce({
+      ok: false,
+      error: { code: 'INVALID_RUN_BUDGET', message: 'Ліміт витрат має бути…', retryable: false },
+    });
+
+    expect(
+      await gateway.call(SENDER, { op: 'settings.update', params: { run_budget_usd: 'abc' } }),
+    ).toEqual({
+      ok: false,
+      error: { code: 'INVALID_RUN_BUDGET', message: 'Ліміт витрат має бути…', retryable: false },
+    });
+  });
+
+  it('turns a settings answer of another shape into an error', async () => {
+    const { gateway, request } = setup();
+    request.mockResolvedValueOnce({ ok: true, data: { ...SETTINGS, has_api_key: 'yes' } });
+
+    expect(await gateway.call(SENDER, { op: 'settings.get', params: {} })).toMatchObject({
+      ok: false,
+      error: { code: 'BAD_BACKEND_RESPONSE' },
+    });
+  });
+});
+
+describe('transcription ops and jobs.resume (ADR 038)', () => {
+  it('estimate posts only the source and the track, and answers exactly the thirteen fields', async () => {
+    const { gateway, request } = setup();
+    request.mockResolvedValueOnce({
+      ok: true,
+      data: { ...ESTIMATE, existing: { transcript_id: ID, run_id: ID2, path: 'C:\\x' }, extra: 1 },
+    });
+
+    const result = await gateway.call(SENDER, {
+      op: 'transcription.estimate',
+      params: { source_id: ID, audio_stream_index: 1 },
+    });
+
+    expect(request.mock.calls).toEqual([
+      ['POST', '/v1/transcription-runs/estimate', { source_id: ID, audio_stream_index: 1 }],
+    ]);
+    expect(result).toEqual({
+      ok: true,
+      data: { ...ESTIMATE, existing: { transcript_id: ID, run_id: ID2 } },
+    });
+  });
+
+  it('create sends force only when it was given, and answers the run and its job', async () => {
+    const { gateway, request } = setup();
+    request.mockResolvedValue({ ok: true, data: { ...CREATED, extra: 1 } });
+
+    const plain = await gateway.call(SENDER, {
+      op: 'transcription.create',
+      params: { source_id: ID, audio_stream_index: 2 },
+    });
+    await gateway.call(SENDER, {
+      op: 'transcription.create',
+      params: { source_id: ID, audio_stream_index: 2, force: true },
+    });
+
+    expect(request.mock.calls).toEqual([
+      ['POST', '/v1/transcription-runs', { source_id: ID, audio_stream_index: 2 }],
+      ['POST', '/v1/transcription-runs', { source_id: ID, audio_stream_index: 2, force: true }],
+    ]);
+    expect(plain).toEqual({ ok: true, data: CREATED });
+  });
+
+  it('get and list read the run and the runs of a source; the answers lose unknown keys', async () => {
+    const { gateway, request } = setup();
+    request.mockResolvedValueOnce({
+      ok: true,
+      data: {
+        ...TRANSCRIPTION_RUN,
+        chunks: [{ ...TRANSCRIPTION_RUN.chunks[0], response_path: 'C:\\x' }],
+        extra: 1,
+      },
+    });
+    request.mockResolvedValueOnce({
+      ok: true,
+      data: { items: [{ ...TRANSCRIPTION_ITEM, extra: 1 }] },
+    });
+
+    const run = await gateway.call(SENDER, { op: 'transcription.get', params: { id: ID } });
+    const runs = await gateway.call(SENDER, {
+      op: 'transcription.list',
+      params: { source_id: ID2 },
+    });
+
+    expect(request.mock.calls).toEqual([
+      ['GET', `/v1/transcription-runs/${ID}`, undefined],
+      ['GET', `/v1/transcription-runs?source_id=${ID2}`, undefined],
+    ]);
+    expect(run).toEqual({ ok: true, data: TRANSCRIPTION_RUN });
+    expect(runs).toEqual({ ok: true, data: { items: [TRANSCRIPTION_ITEM] } });
+  });
+
+  it('resume posts an empty body, or only retry_unknown, and answers the job', async () => {
+    const { gateway, request } = setup();
+    const job = { ...JOB, type: 'transcription', state: 'queued' };
+    request.mockResolvedValue({ ok: true, data: { ...job, lease_owner: 'x' } });
+
+    const first = await gateway.call(SENDER, { op: 'jobs.resume', params: { id: ID } });
+    await gateway.call(SENDER, { op: 'jobs.resume', params: { id: ID, retry_unknown: true } });
+
+    expect(request.mock.calls).toEqual([
+      ['POST', `/v1/jobs/${ID}/resume`, {}],
+      ['POST', `/v1/jobs/${ID}/resume`, { retry_unknown: true }],
+    ]);
+    expect(first).toEqual({ ok: true, data: job });
+  });
+
+  it.each([
+    ['transcription.estimate', { source_id: ID, audio_stream_index: 1, model: 'vendor/model' }],
+    ['transcription.estimate', { source_id: ID, audio_stream_index: 1, budget_usd: '1.00' }],
+    ['transcription.estimate', { source_id: ID, audio_stream_index: '1' }],
+    ['transcription.create', { source_id: ID, audio_stream_index: 1, language: 'uk' }],
+    ['transcription.create', { source_id: ID, audio_stream_index: 1, openrouter_api_key: 'k' }],
+    ['transcription.create', { source_id: ID, audio_stream_index: 1, force: 'yes' }],
+    ['transcription.create', { source_id: 'x', audio_stream_index: 1 }],
+    ['transcription.get', { id: `${ID}/../health` }],
+    ['transcription.list', { source_id: `${ID}&x=1` }],
+    ['transcription.list', { source_id: ID, limit: 5 }],
+    ['jobs.resume', { id: ID, budget_usd: '0.00' }],
+    ['jobs.resume', { id: ID, budget_usd: 9 }],
+    ['jobs.resume', { id: ID, retry_unknown: 'true' }],
+  ] as const)('%s refuses %j without calling the sidecar', async (op, params) => {
+    const { gateway, request } = setup();
+
+    expect(await gateway.call(SENDER, { op, params })).toMatchObject({
+      ok: false,
+      error: { code: 'INVALID_PARAMS' },
+    });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('forwards a refusal of the backend with its code and message, and nothing else', async () => {
+    const { gateway, request } = setup();
+    const refusal = {
+      ok: false,
+      error: { code: 'TRANSCRIPT_ALREADY_EXISTS', message: 'Транскрипт уже є', retryable: false },
+    } as const;
+    request.mockResolvedValueOnce(refusal);
+
+    expect(
+      await gateway.call(SENDER, {
+        op: 'transcription.create',
+        params: { source_id: ID, audio_stream_index: 1 },
+      }),
+    ).toEqual(refusal);
+  });
+
+  it('turns an answer of another shape into an error, for every transcription op', async () => {
+    const { gateway, request } = setup();
+    const broken: readonly (readonly [ApiOp, unknown, unknown])[] = [
+      ['transcription.estimate', { source_id: ID, audio_stream_index: 1 }, { ...ESTIMATE, chunk_count: '1' }],
+      ['transcription.create', { source_id: ID, audio_stream_index: 1 }, { id: ID }],
+      ['transcription.get', { id: ID }, { ...TRANSCRIPTION_RUN, chunks: [{ id: ID }] }],
+      ['transcription.list', { source_id: ID }, { items: [{ ...TRANSCRIPTION_ITEM, created_at: 5 }] }],
+      ['jobs.resume', { id: ID }, { ...JOB, progress: 5 }],
+    ];
+
+    for (const [op, params, data] of broken) {
+      request.mockResolvedValueOnce({ ok: true, data });
+
+      expect(await gateway.call(SENDER, { op, params }), op).toMatchObject({
+        ok: false,
+        error: { code: 'BAD_BACKEND_RESPONSE' },
+      });
+    }
+  });
+});
+
+describe('transcripts, credentials and the resume budget (ADR 038, 039)', () => {
+  it('jobs.resume sends the budget next to the decision, and only the params that were given', async () => {
+    const { gateway, request } = setup();
+    const job = { ...JOB, type: 'transcription', state: 'queued' };
+    request.mockResolvedValue({ ok: true, data: job });
+
+    await gateway.call(SENDER, { op: 'jobs.resume', params: { id: ID, budget_usd: '5.00' } });
+    await gateway.call(SENDER, {
+      op: 'jobs.resume',
+      params: { id: ID, retry_unknown: true, budget_usd: '1000' },
+    });
+
+    expect(request.mock.calls).toEqual([
+      ['POST', `/v1/jobs/${ID}/resume`, { budget_usd: '5.00' }],
+      ['POST', `/v1/jobs/${ID}/resume`, { retry_unknown: true, budget_usd: '1000' }],
+    ]);
+  });
+
+  it.each([
+    ['jobs.resume', { id: ID, budget_usd: null }],
+    ['jobs.resume', { id: ID, budget_usd: '0.009999' }],
+    ['jobs.resume', { id: ID, budget_usd: '1000.000001' }],
+    ['jobs.resume', { id: ID, budget_usd: '1001' }],
+    ['jobs.resume', { id: ID, budget_usd: '05' }],
+    ['transcripts.get', { id: ID, limit: 0 }],
+    ['transcripts.get', { id: ID, limit: 1001 }],
+    ['transcripts.get', { id: ID, offset: -1 }],
+    ['transcripts.get', { id: ID, openrouter_api_key: 'k' }],
+    ['transcripts.list', { source_id: 'x' }],
+    ['transcripts.correct', { id: ID, edits: [] }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: 'w1', segment_id: 's1', text: 'a' }] }],
+    ['transcripts.correct', { id: ID, edits: [{ word_id: 'w1', text: '   ' }] }],
+    ['credentials.check', { openrouter_api_key: 'k' }],
+  ] as const)('%s refuses %j without calling the sidecar', async (op, params) => {
+    const { gateway, request } = setup();
+
+    expect(await gateway.call(SENDER, { op, params })).toMatchObject({
+      ok: false,
+      error: { code: 'INVALID_PARAMS' },
+    });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('transcripts.list pages with the opaque cursor, encoded, and keeps no metadata', async () => {
+    const { gateway, request } = setup();
+    request.mockResolvedValueOnce({ ok: true, data: { items: [TRANSCRIPT], next_cursor: 'c2' } });
+
+    const result = await gateway.call(SENDER, {
+      op: 'transcripts.list',
+      params: { source_id: ID2, cursor: 'c1&source_id=x' },
+    });
+
+    expect(request.mock.calls).toEqual([
+      ['GET', `/v1/transcripts?source_id=${ID2}&cursor=c1%26source_id%3Dx`, undefined],
+    ]);
+    expect(result).toEqual({ ok: true, data: { items: [TRANSCRIPT_DTO], next_cursor: 'c2' } });
+  });
+
+  it('transcripts.get sends the window as a query and answers the window without metadata', async () => {
+    const { gateway, request } = setup();
+    request.mockResolvedValueOnce({ ok: true, data: { ...TRANSCRIPT_WINDOW, limit: 1000 } });
+
+    const result = await gateway.call(SENDER, {
+      op: 'transcripts.get',
+      params: { id: ID, limit: 1000 },
+    });
+
+    expect(request.mock.calls).toEqual([['GET', `/v1/transcripts/${ID}?limit=1000`, undefined]]);
+    expect(result).toEqual({
+      ok: true,
+      data: {
+        ...TRANSCRIPT_DTO,
+        offset: 0,
+        limit: 1000,
+        next_offset: null,
+        segments: [TRANSCRIPT_SEGMENT],
+        words: TRANSCRIPT_WORDS,
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain('options_hash');
+  });
+
+  it('transcripts.correct posts exactly the edits and answers the new revision', async () => {
+    const { gateway, request } = setup();
+    request.mockResolvedValueOnce({ ok: true, data: TRANSCRIPT });
+
+    const result = await gateway.call(SENDER, {
+      op: 'transcripts.correct',
+      params: { id: ID, edits: [{ segment_id: 's1', text: 'Привіт, світ' }] },
+    });
+
+    expect(request.mock.calls).toEqual([
+      [
+        'POST',
+        `/v1/transcripts/${ID}/corrections`,
+        { edits: [{ segment_id: 's1', text: 'Привіт, світ' }] },
+      ],
+    ]);
+    expect(result).toEqual({ ok: true, data: TRANSCRIPT_DTO });
+  });
+
+  it('credentials.check posts with no body, answers valid or invalid, and refuses a malformed answer', async () => {
+    const { gateway, request } = setup();
+    request.mockResolvedValueOnce({
+      ok: true,
+      data: { state: 'valid', is_free_tier: true, limit_remaining_usd: null, label: 'x' },
+    });
+    request.mockResolvedValueOnce({ ok: true, data: { state: 'invalid' } });
+    request.mockResolvedValueOnce({
+      ok: true,
+      data: { state: 'valid', is_free_tier: 'no', limit_remaining_usd: null },
+    });
+
+    const valid = await gateway.call(SENDER, { op: 'credentials.check', params: {} });
+    const invalid = await gateway.call(SENDER, { op: 'credentials.check' });
+    const broken = await gateway.call(SENDER, { op: 'credentials.check', params: {} });
+
+    expect(request.mock.calls).toEqual([
+      ['POST', '/v1/runtime/credentials/check', undefined],
+      ['POST', '/v1/runtime/credentials/check', undefined],
+      ['POST', '/v1/runtime/credentials/check', undefined],
+    ]);
+    expect(valid).toEqual({
+      ok: true,
+      data: { state: 'valid', is_free_tier: true, limit_remaining_usd: null },
+    });
+    expect(invalid).toEqual({ ok: true, data: { state: 'invalid' } });
+    expect(broken).toMatchObject({ ok: false, error: { code: 'BAD_BACKEND_RESPONSE' } });
+  });
+
+  it('credentials.check forwards the upstream error with its code, message and retryable', async () => {
+    const { gateway, request } = setup();
+    const refusal = {
+      ok: false,
+      error: { code: 'KEY_CHECK_UPSTREAM', message: 'OpenRouter не відповів', retryable: true },
+    } as const;
+    request.mockResolvedValueOnce(refusal);
+
+    expect(await gateway.call(SENDER, { op: 'credentials.check', params: {} })).toEqual(refusal);
   });
 });
 

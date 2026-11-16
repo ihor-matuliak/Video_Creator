@@ -159,7 +159,7 @@ export function SourcesTab({
       </DropZone>
       <p className="note">
         <span aria-hidden="true">ⓘ </span>
-        Відео залишається на цьому комп'ютері.
+        Відео залишається на цьому комп'ютері. Для транскрипції надсилається вибране аудіо.
       </p>
 
       {state.kind === 'importing' && (

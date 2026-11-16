@@ -75,6 +75,53 @@ const CLIP = {
   updated_at: '2026-11-14T10:00:00Z',
 };
 
+const ESTIMATE = {
+  source_id: ID,
+  audio_stream_index: 1,
+  model: 'microsoft/mai-transcribe-2',
+  language: 'uk',
+  duration_ms: 125_000,
+  chunk_count: 1,
+  billed_seconds: 125,
+  usd_per_second_upper: '0.0001',
+  estimate_micro_usd: 12_500,
+  price_basis: 'upper_bound_per_second',
+  budget_usd: '2.50',
+  within_budget: true,
+  existing: { transcript_id: ID, run_id: ID },
+};
+const RUN_FIELDS = {
+  id: ID,
+  source_id: ID,
+  job_id: ID,
+  model: 'microsoft/mai-transcribe-2',
+  status: 'partial',
+  revision_id: null,
+  error_code: 'TRANSCRIPTION_PARTIAL',
+  committed_micro_usd: 12_500,
+};
+const RUN = {
+  ...RUN_FIELDS,
+  chunks: [
+    {
+      id: ID,
+      core_start_ms: 0,
+      core_end_ms: 60_000,
+      state: 'succeeded',
+      attempts: 1,
+      error_code: null,
+    },
+    {
+      id: '0a9d7e6c-1b2f-4c3d-8e4f-5a6b7c8d9e0f',
+      core_start_ms: 60_000,
+      core_end_ms: 125_000,
+      state: 'unknown_outcome',
+      attempts: 1,
+      error_code: 'STT_UNKNOWN_OUTCOME',
+    },
+  ],
+};
+
 describe('ids and tokens', () => {
   it('isUuid4 accepts only lowercase uuid4', () => {
     expect(isUuid4(ID)).toBe(true);
@@ -192,6 +239,46 @@ describe('response parsers', () => {
     });
   });
 
+  it('settings.get and settings.update keep the five fields and drop every other key', () => {
+    const settings = {
+      stt_model: 'microsoft/mai-transcribe-2',
+      stt_language: 'uk',
+      analysis_model: null,
+      run_budget_usd: '2.50',
+      has_api_key: true,
+    };
+
+    for (const op of ['settings.get', 'settings.update'] as const) {
+      expect(
+        API_DATA_PARSERS[op]({ ...settings, openrouter_api_key: 'k'.repeat(30), extra: 1 }),
+      ).toEqual(settings);
+    }
+  });
+
+  it('settings refuses a missing field and a wrong type', () => {
+    const settings = {
+      stt_model: 'microsoft/mai-transcribe-2',
+      stt_language: null,
+      analysis_model: null,
+      run_budget_usd: null,
+      has_api_key: false,
+    };
+    const parse = API_DATA_PARSERS['settings.get'];
+
+    for (const bad of [
+      null,
+      [],
+      {},
+      { ...settings, stt_model: null },
+      { ...settings, stt_language: 5 },
+      { ...settings, run_budget_usd: 2.5 },
+      { ...settings, has_api_key: 'yes' },
+      { ...settings, has_api_key: undefined },
+    ]) {
+      expect(() => parse(bad)).toThrow(TypeError);
+    }
+  });
+
   it('system.checks refuses a missing check, a wrong type and a negative or fractional free space', () => {
     const checks = {
       ffmpeg: { ok: true, version: '8.0.1' },
@@ -214,6 +301,186 @@ describe('response parsers', () => {
       { ...checks, data_dir: { ok: true, free_bytes: 0.5 } },
       { ...checks, data_dir: { ok: true, free_bytes: '5' } },
     ]) {
+      expect(() => parse(bad)).toThrow(TypeError);
+    }
+  });
+
+  it('transcription.estimate keeps its thirteen fields and drops every other key', () => {
+    const parse = API_DATA_PARSERS['transcription.estimate'];
+
+    expect(parse({ ...ESTIMATE, path: 'C:\\x', openrouter_api_key: 'k'.repeat(30) })).toEqual(
+      ESTIMATE,
+    );
+    expect(parse({ ...ESTIMATE, existing: { ...ESTIMATE.existing, extra: 1 } })).toEqual(ESTIMATE);
+  });
+
+  it('transcription.estimate keeps the nulls of a run without a language, a budget or a repeat', () => {
+    const open = {
+      ...ESTIMATE,
+      language: null,
+      budget_usd: null,
+      within_budget: null,
+      existing: null,
+    };
+
+    expect(API_DATA_PARSERS['transcription.estimate'](open)).toEqual(open);
+    expect(
+      API_DATA_PARSERS['transcription.estimate']({ ...ESTIMATE, within_budget: false }),
+    ).toMatchObject({ within_budget: false });
+  });
+
+  it('transcription.estimate refuses a missing field and a wrong type', () => {
+    const parse = API_DATA_PARSERS['transcription.estimate'];
+
+    for (const bad of [
+      null,
+      [],
+      {},
+      { ...ESTIMATE, source_id: undefined },
+      { ...ESTIMATE, audio_stream_index: '1' },
+      { ...ESTIMATE, audio_stream_index: 1.5 },
+      { ...ESTIMATE, model: null },
+      { ...ESTIMATE, language: 5 },
+      { ...ESTIMATE, duration_ms: '12000' },
+      { ...ESTIMATE, duration_ms: -1 },
+      { ...ESTIMATE, chunk_count: 1.5 },
+      { ...ESTIMATE, billed_seconds: null },
+      { ...ESTIMATE, usd_per_second_upper: 0.0001 },
+      { ...ESTIMATE, estimate_micro_usd: '1200' },
+      { ...ESTIMATE, estimate_micro_usd: -5 },
+      { ...ESTIMATE, price_basis: undefined },
+      { ...ESTIMATE, budget_usd: 2.5 },
+      { ...ESTIMATE, within_budget: 'yes' },
+      { ...ESTIMATE, within_budget: undefined },
+      { ...ESTIMATE, existing: undefined },
+      { ...ESTIMATE, existing: {} },
+      { ...ESTIMATE, existing: { transcript_id: ID } },
+      { ...ESTIMATE, existing: { transcript_id: ID, run_id: 7 } },
+      { ...ESTIMATE, existing: [] },
+    ]) {
+      expect(() => parse(bad)).toThrow(TypeError);
+    }
+    expect(() => parse({ ...ESTIMATE, existing: { transcript_id: ID } })).toThrow(/поле existing$/);
+  });
+
+  it('transcription.create keeps the id of the run and of its job', () => {
+    const created = { id: ID, job_id: ID, status: 'queued' };
+    const parse = API_DATA_PARSERS['transcription.create'];
+
+    expect(parse({ ...created, source_id: ID, extra: 1 })).toEqual(created);
+    for (const bad of [
+      null,
+      {},
+      { id: ID },
+      { ...created, job_id: null },
+      { ...created, job_id: 5 },
+      { ...created, status: undefined },
+      { ...created, id: 1 },
+    ]) {
+      expect(() => parse(bad)).toThrow(TypeError);
+    }
+  });
+
+  it('transcription.get keeps the run with its parts and drops every other key', () => {
+    const parse = API_DATA_PARSERS['transcription.get'];
+
+    expect(
+      parse({
+        ...RUN,
+        created_at: '2026-11-16T10:00:00Z',
+        chunks: RUN.chunks.map((chunk) => ({ ...chunk, response_path: 'C:\\x' })),
+      }),
+    ).toEqual(RUN);
+    expect(parse({ ...RUN, job_id: null, revision_id: null, error_code: null })).toMatchObject({
+      job_id: null,
+      revision_id: null,
+      error_code: null,
+    });
+    expect(parse({ ...RUN, chunks: [] }).chunks).toEqual([]);
+  });
+
+  it('transcription.get refuses a missing field and a wrong type, in the run or in a part', () => {
+    const parse = API_DATA_PARSERS['transcription.get'];
+    const chunk = RUN.chunks[0];
+
+    for (const bad of [
+      null,
+      [],
+      {},
+      { ...RUN, id: 5 },
+      { ...RUN, source_id: undefined },
+      { ...RUN, job_id: undefined },
+      { ...RUN, job_id: 7 },
+      { ...RUN, model: null },
+      { ...RUN, status: 1 },
+      { ...RUN, revision_id: 7 },
+      { ...RUN, error_code: 7 },
+      { ...RUN, committed_micro_usd: '0' },
+      { ...RUN, committed_micro_usd: 1.5 },
+      { ...RUN, committed_micro_usd: -1 },
+      { ...RUN, chunks: undefined },
+      { ...RUN, chunks: null },
+      { ...RUN, chunks: 'a' },
+      { ...RUN, chunks: [null] },
+      { ...RUN, chunks: [{ ...chunk, id: 1 }] },
+      { ...RUN, chunks: [{ ...chunk, core_start_ms: '0' }] },
+      { ...RUN, chunks: [{ ...chunk, core_end_ms: 1.5 }] },
+      { ...RUN, chunks: [{ ...chunk, state: null }] },
+      { ...RUN, chunks: [{ ...chunk, attempts: '1' }] },
+      { ...RUN, chunks: [{ ...chunk, attempts: -1 }] },
+      { ...RUN, chunks: [{ ...chunk, error_code: 5 }] },
+      { ...RUN, chunks: [{ ...chunk, error_code: undefined }] },
+    ]) {
+      expect(() => parse(bad)).toThrow(TypeError);
+    }
+    expect(() => parse({ ...RUN, committed_micro_usd: '0' })).toThrow(/поле committed_micro_usd$/);
+    expect(() => parse({ ...RUN, chunks: [{ ...chunk, attempts: '1' }] })).toThrow(/поле chunks$/);
+  });
+
+  it('transcription.list keeps the runs without their parts, newest first as the backend sent them', () => {
+    const older = {
+      ...RUN_FIELDS,
+      id: '0a9d7e6c-1b2f-4c3d-8e4f-5a6b7c8d9e0f',
+      created_at: '2026-11-15T10:00:00Z',
+    };
+    const newer = { ...RUN_FIELDS, created_at: '2026-11-16T10:00:00Z' };
+    const parse = API_DATA_PARSERS['transcription.list'];
+
+    expect(parse({ items: [newer, older], extra: 1 })).toEqual({ items: [newer, older] });
+    expect(parse({ items: [{ ...newer, chunks: RUN.chunks }] })).toEqual({ items: [newer] });
+    expect(parse({ items: [] })).toEqual({ items: [] });
+  });
+
+  it('transcription.list refuses an answer that is not {items} of runs, with created_at', () => {
+    const item = { ...RUN_FIELDS, created_at: '2026-11-16T10:00:00Z' };
+    const parse = API_DATA_PARSERS['transcription.list'];
+
+    for (const bad of [
+      null,
+      [],
+      {},
+      { items: null },
+      { items: {} },
+      { items: [null] },
+      { items: [RUN_FIELDS] },
+      { items: [{ ...item, created_at: 5 }] },
+      { items: [{ ...item, model: undefined }] },
+      { items: [{ ...item, committed_micro_usd: '0' }] },
+      { items: [{ ...item, revision_id: 7 }] },
+    ]) {
+      expect(() => parse(bad)).toThrow(TypeError);
+    }
+  });
+
+  it('jobs.resume answers with the job, like jobs.cancel', () => {
+    const job = { id: ID, type: 'transcription', state: 'queued', progress: {}, error: null };
+    const parse = API_DATA_PARSERS['jobs.resume'];
+
+    expect(parse({ ...job, lease_owner: 'x' })).toEqual(job);
+    expect(parse({ ...job, state: 'failed', error: { code: 'STT_FUNDS', message: 'Баланс' } })).toMatchObject({
+      error: { code: 'STT_FUNDS', message: 'Баланс' },
+    });
+    for (const bad of [null, {}, { ...job, progress: 5 }, { ...job, error: { code: 'X' } }, { ...job, state: 1 }]) {
       expect(() => parse(bad)).toThrow(TypeError);
     }
   });
@@ -360,6 +627,226 @@ describe('response parsers', () => {
   it('names the failing field but never echoes its value', () => {
     expect(() => parseProject({ ...PROJECT, name: { secret: 'tok-123' } })).toThrow(
       /поле name$/,
+    );
+  });
+});
+
+describe('transcript and credential parsers (ADR 030, 039)', () => {
+  const REVISION = {
+    id: ID,
+    source_id: ID,
+    revision: 2,
+    origin: 'correction',
+    run_id: null,
+    parent_id: ID,
+    timing_level: 'word',
+    language: 'uk',
+    duration_ms: 125_000,
+    word_count: 2,
+    segment_count: 1,
+    coverage: [{ start_ms: 0, end_ms: 125_000, state: 'succeeded' }],
+    created_at: '2026-11-16T10:00:00Z',
+  };
+  const WORD = {
+    id: 'w1',
+    ordinal: 0,
+    start_ms: 0,
+    end_ms: 400,
+    text: 'Привіт',
+    chunk_id: ID,
+    speaker_local: null,
+    confidence: 0.91,
+  };
+  const SEGMENT = {
+    id: 's1',
+    ordinal: 0,
+    start_ms: 0,
+    end_ms: 900,
+    text: 'Привіт світ',
+    word_ids: ['w1', 'w2'],
+    timing_level: 'word',
+  };
+  const WINDOW = {
+    ...REVISION,
+    offset: 0,
+    limit: 200,
+    next_offset: null,
+    segments: [SEGMENT],
+    words: [WORD],
+  };
+  /** The backend's own dump of the revision: main must not keep it. */
+  const METADATA = { metadata: { provider: 'openrouter', options_hash: 'secret-looking' } };
+
+  it('transcripts.list keeps the revisions and the cursor, and drops metadata and unknown keys', () => {
+    const parse = API_DATA_PARSERS['transcripts.list'];
+
+    expect(
+      parse({ items: [{ ...REVISION, ...METADATA, extra: 1 }], next_cursor: 'c2', path: 'C:\\x' }),
+    ).toEqual({ items: [REVISION], next_cursor: 'c2' });
+    expect(parse({ items: [], next_cursor: null })).toEqual({ items: [], next_cursor: null });
+  });
+
+  it('transcripts.correct answers the new revision without metadata', () => {
+    const parse = API_DATA_PARSERS['transcripts.correct'];
+    const parsed = parse({ ...REVISION, ...METADATA });
+
+    expect(parsed).toEqual(REVISION);
+    expect(Object.keys(parsed)).not.toContain('metadata');
+    expect(parse({ ...REVISION, run_id: ID, parent_id: null })).toMatchObject({
+      run_id: ID,
+      parent_id: null,
+    });
+  });
+
+  it('transcripts.get keeps the window: the revision, offset, limit, next_offset, segments and words', () => {
+    const parse = API_DATA_PARSERS['transcripts.get'];
+
+    expect(parse({ ...WINDOW, ...METADATA, words: [{ ...WORD, extra: 1 }] })).toEqual(WINDOW);
+    expect(parse({ ...WINDOW, next_offset: 200 }).next_offset).toBe(200);
+    expect(parse({ ...WINDOW, words: [{ ...WORD, confidence: null }] }).words[0]?.confidence).toBeNull();
+    expect(parse({ ...WINDOW, segments: [], words: [] })).toMatchObject({ segments: [], words: [] });
+  });
+
+  it('transcripts refuses a missing field and a wrong type in the revision', () => {
+    const parse = API_DATA_PARSERS['transcripts.correct'];
+
+    for (const bad of [
+      null,
+      [],
+      {},
+      { ...REVISION, id: 5 },
+      { ...REVISION, source_id: undefined },
+      { ...REVISION, revision: '2' },
+      { ...REVISION, revision: -1 },
+      { ...REVISION, revision: 1.5 },
+      { ...REVISION, origin: null },
+      { ...REVISION, run_id: 7 },
+      { ...REVISION, parent_id: undefined },
+      { ...REVISION, language: null },
+      { ...REVISION, duration_ms: '1' },
+      { ...REVISION, word_count: undefined },
+      { ...REVISION, segment_count: -1 },
+      { ...REVISION, coverage: undefined },
+      { ...REVISION, coverage: {} },
+      { ...REVISION, coverage: [null] },
+      { ...REVISION, coverage: [{ start_ms: 0, end_ms: 1 }] },
+      { ...REVISION, coverage: [{ start_ms: '0', end_ms: 1, state: 'succeeded' }] },
+      { ...REVISION, created_at: 5 },
+    ]) {
+      expect(() => parse(bad)).toThrow(TypeError);
+    }
+    expect(() => parse({ ...REVISION, word_count: undefined })).toThrow(/поле word_count$/);
+  });
+
+  it('transcripts.get refuses a missing field and a wrong type in the window, a segment or a word', () => {
+    const parse = API_DATA_PARSERS['transcripts.get'];
+
+    for (const bad of [
+      { ...WINDOW, offset: undefined },
+      { ...WINDOW, limit: '200' },
+      { ...WINDOW, next_offset: 'x' },
+      { ...WINDOW, segments: null },
+      { ...WINDOW, segments: [{ ...SEGMENT, word_ids: 'w1' }] },
+      { ...WINDOW, segments: [{ ...SEGMENT, word_ids: [1] }] },
+      { ...WINDOW, segments: [{ ...SEGMENT, timing_level: undefined }] },
+      { ...WINDOW, words: undefined },
+      { ...WINDOW, words: [null] },
+      { ...WINDOW, words: [{ ...WORD, confidence: '0.9' }] },
+      { ...WINDOW, words: [{ ...WORD, confidence: Number.POSITIVE_INFINITY }] },
+      { ...WINDOW, words: [{ ...WORD, confidence: undefined }] },
+      { ...WINDOW, words: [{ ...WORD, chunk_id: undefined }] },
+      { ...WINDOW, words: [{ ...WORD, speaker_local: 5 }] },
+    ]) {
+      expect(() => parse(bad)).toThrow(TypeError);
+    }
+    expect(() => parse({ ...WINDOW, offset: undefined })).toThrow(/поле offset$/);
+  });
+
+  it('transcripts.list refuses a page that is not {items, next_cursor} of revisions', () => {
+    const parse = API_DATA_PARSERS['transcripts.list'];
+
+    for (const bad of [
+      null,
+      [],
+      {},
+      { items: null, next_cursor: null },
+      { items: [REVISION] },
+      { items: [REVISION], next_cursor: 5 },
+      { items: [null], next_cursor: null },
+    ]) {
+      expect(() => parse(bad)).toThrow(TypeError);
+    }
+  });
+
+  it('credentials.check: valid keeps the free-tier flag and the remaining limit, and drops every other key', () => {
+    const parse = API_DATA_PARSERS['credentials.check'];
+
+    expect(
+      parse({ state: 'valid', is_free_tier: false, limit_remaining_usd: '4.25', label: 'x', usage: 1 }),
+    ).toEqual({ state: 'valid', is_free_tier: false, limit_remaining_usd: '4.25' });
+    expect(parse({ state: 'valid', is_free_tier: true, limit_remaining_usd: null })).toEqual({
+      state: 'valid',
+      is_free_tier: true,
+      limit_remaining_usd: null,
+    });
+    expect(parse({ state: 'valid', is_free_tier: false, limit_remaining_usd: '-0.5' })).toEqual({
+      state: 'valid',
+      is_free_tier: false,
+      limit_remaining_usd: '-0.5',
+    });
+  });
+
+  it('credentials.check: invalid keeps only its state', () => {
+    expect(API_DATA_PARSERS['credentials.check']({ state: 'invalid', is_free_tier: true, limit_remaining_usd: '1', label: 'x' })).toEqual({
+      state: 'invalid',
+    });
+  });
+
+  it('credentials.check refuses an unknown state, a missing or wrong field, and a non-object', () => {
+    const parse = API_DATA_PARSERS['credentials.check'];
+
+    for (const bad of [
+      null,
+      [],
+      {},
+      { state: 'ok' },
+      { state: null },
+      { state: 'VALID', is_free_tier: false, limit_remaining_usd: null },
+      { state: 'valid' },
+      { state: 'valid', is_free_tier: 'no', limit_remaining_usd: null },
+      { state: 'valid', is_free_tier: false },
+      { state: 'valid', is_free_tier: false, limit_remaining_usd: 4.25 },
+      { state: 'valid', is_free_tier: undefined, limit_remaining_usd: null },
+    ]) {
+      expect(() => parse(bad)).toThrow(TypeError);
+    }
+    expect(() => parse({ state: 'valid', is_free_tier: 'no', limit_remaining_usd: null })).toThrow(
+      /поле is_free_tier$/,
+    );
+  });
+
+  it('credentials.check accepts limit_remaining_usd as null or a plain decimal string, a minus sign included', () => {
+    const parse = API_DATA_PARSERS['credentials.check'];
+
+    for (const limit of ['4.25', '0', '5', '-5', '-0.5', '-0.01', null]) {
+      expect(parse({ state: 'valid', is_free_tier: false, limit_remaining_usd: limit })).toEqual({
+        state: 'valid',
+        is_free_tier: false,
+        limit_remaining_usd: limit,
+      });
+    }
+  });
+
+  it('credentials.check refuses limit_remaining_usd that is not null or a plain decimal string', () => {
+    const parse = API_DATA_PARSERS['credentials.check'];
+
+    for (const limit of ['1e-3', '1.5E2', ' 2.5', '2.', '.5', '', 'abc', '+1']) {
+      expect(() => parse({ state: 'valid', is_free_tier: false, limit_remaining_usd: limit })).toThrow(
+        TypeError,
+      );
+    }
+    expect(() => parse({ state: 'valid', is_free_tier: false, limit_remaining_usd: '1e-3' })).toThrow(
+      /поле limit_remaining_usd$/,
     );
   });
 });

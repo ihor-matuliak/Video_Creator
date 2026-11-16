@@ -44,6 +44,7 @@ ADR 012, 015. Віртуальний uv workspace у корені, пакет `c
 | uvicorn | 0.54.0 |
 | pydantic | 2.14.3 |
 | httpx2 | 2.16.0 |
+| httpcore2 | 2.16.0 |
 | sqlalchemy | 2.1.8 |
 | alembic | 1.20.1 |
 | dev: pytest / pytest-asyncio / hypothesis | 9.2.0 / 1.5.0 / 6.170.15 |

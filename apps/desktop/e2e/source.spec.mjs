@@ -73,7 +73,9 @@ test(
     await expect(page.getByTestId('source-fps')).toHaveText('30 к/с');
     await expect(page.getByTestId('source-vfr')).toHaveText('✓ Постійна частота кадрів');
     await expect(page.getByTestId('source-playback')).toHaveText('Напряму');
-    await expect(page.getByTestId('source-local-note')).toHaveText("Відео залишається на цьому комп'ютері.");
+    await expect(page.getByTestId('source-local-note')).toHaveText(
+      "Відео залишається на цьому комп'ютері. Для транскрипції надсилається вибране аудіо.",
+    );
   }),
 );
 
@@ -87,6 +89,8 @@ test(
     await expect(page.getByTestId('source-playback')).toHaveText(
       'Потрібна копія для перегляду. Причина: контейнер файлу не підтримується програвачем',
     );
-    await expect(page.getByTestId('source-local-note')).toHaveText("Відео залишається на цьому комп'ютері.");
+    await expect(page.getByTestId('source-local-note')).toHaveText(
+      "Відео залишається на цьому комп'ютері. Для транскрипції надсилається вибране аудіо.",
+    );
   }),
 );

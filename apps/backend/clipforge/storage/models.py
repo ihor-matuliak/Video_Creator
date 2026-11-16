@@ -8,12 +8,13 @@ Times: ``*_ms`` columns are integer milliseconds, source-relative, intervals ``[
 Timestamps (``created_at`` ...) are ISO 8601 UTC text from ``util.utc_now``.
 """
 
-from typing import Any
+from typing import Any, Final
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -37,6 +38,31 @@ JOB_STATES = (
     "interrupted",
 )
 PREVIEW_STATUSES = ("queued", "running", "ready", "failed", "cancelled", "interrupted")
+TRANSCRIPT_ORIGINS = ("import", "stt", "correction")
+TIMING_LEVELS = ("word", "segment")
+# FR-018: the state of one STT chunk. ``superseded`` (docs/05 section 4, ADR 032) marks a parent
+# that was split into two smaller chunks; it is never sent and never part of the coverage.
+CHUNK_STATES = (
+    "pending",
+    "running",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "unknown_outcome",
+    "superseded",
+)
+# FR-049: the state of one paid-request reservation in the spend ledger. This is the only place
+# the state names are written; the CHECK, the repository and the ledger service all use them.
+SPEND_RESERVED: Final = "reserved"
+SPEND_COMPLETED: Final = "completed"
+SPEND_UNKNOWN_OUTCOME: Final = "unknown_outcome"
+SPEND_RELEASED: Final = "released"
+SPEND_STATES: Final = (SPEND_RESERVED, SPEND_COMPLETED, SPEND_UNKNOWN_OUTCOME, SPEND_RELEASED)
+# What an entry in each state adds to what its run has committed. Every state is in exactly one of
+# the three groups (a test keeps it so): a new state must be placed on purpose, not fall through.
+SPEND_COUNTS_ACTUAL: Final = (SPEND_COMPLETED,)  # the actual cost, else the reservation
+SPEND_COUNTS_RESERVED: Final = (SPEND_RESERVED, SPEND_UNKNOWN_OUTCOME)  # the reservation
+SPEND_COUNTS_NOTHING: Final = (SPEND_RELEASED,)
 
 
 def _in(column: str, values: tuple[str, ...]) -> str:
@@ -214,3 +240,224 @@ class Job(Base):
     checkpoint_json: Mapped[dict[str, Any] | None] = mapped_column(VersionedJson, nullable=True)
     created_at: Mapped[str] = mapped_column(String, nullable=False)
     updated_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class TranscriptRun(Base):
+    """One STT run over a source (docs/04 section 3). Its result is a ``TranscriptRevision`` whose
+    ``run_id`` points back here; the revision number lives on the revision, not on the run. The
+    ``status`` vocabulary belongs to the transcription service (M3), the DB does not fix it."""
+
+    __tablename__ = "transcript_runs"
+    __table_args__ = (Index("ix_transcript_runs_source_id", "source_id"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    source_id: Mapped[str] = mapped_column(ForeignKey("sources.id"), nullable=False)
+    model: Mapped[str] = mapped_column(String, nullable=False)
+    provider: Mapped[str] = mapped_column(String, nullable=False)
+    options_hash: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    # Spans of {"start_ms", "end_ms", "state"}; NULL until the run has something to report.
+    coverage: Mapped[list[dict[str, Any]] | None] = mapped_column(VersionedJson, nullable=True)
+    usage: Mapped[dict[str, Any] | None] = mapped_column(VersionedJson, nullable=True)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class TranscriptChunk(Base):
+    """One STT request window: the core ``[core_start, core_end)`` plus upload context around it."""
+
+    __tablename__ = "transcript_chunks"
+    __table_args__ = (
+        CheckConstraint(
+            "0 <= core_start_ms AND core_start_ms < core_end_ms", name="ck_transcript_chunks_core"
+        ),
+        CheckConstraint(
+            "0 <= upload_start_ms AND upload_start_ms <= core_start_ms "
+            "AND core_end_ms <= upload_end_ms",
+            name="ck_transcript_chunks_upload",
+        ),
+        CheckConstraint(_in("state", CHUNK_STATES), name="ck_transcript_chunks_state"),
+        CheckConstraint("attempts >= 0", name="ck_transcript_chunks_attempts"),
+        CheckConstraint(
+            "reserved_micro_usd >= 0 AND (actual_micro_usd IS NULL OR actual_micro_usd >= 0)",
+            name="ck_transcript_chunks_costs",
+        ),
+        Index("ix_transcript_chunks_run_id", "run_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("transcript_runs.id"), nullable=False)
+    core_start_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    core_end_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    upload_start_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    upload_end_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(String, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False)
+    request_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # App-owned file with the raw provider response (docs/04 section 3); never a source file.
+    response_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Whole micro-USD summed over every attempt of the chunk (ADR 032); the spend ledger is the
+    # source of truth. ``actual`` stays NULL until an attempt reports a cost.
+    reserved_micro_usd: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    actual_micro_usd: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+
+class TranscriptRevision(Base):
+    """An immutable version of the transcript of a source.
+
+    Every import, STT run and text correction writes a new row (``revision`` counts per source);
+    nothing updates or deletes it afterwards, and the words and segments belong to exactly one
+    revision. The migration enforces this with triggers. ``id`` is what the API calls the
+    transcript id: an analysis run that refers to it refers to this exact text, so evidence ids
+    (``TranscriptWord.id``, ``TranscriptSegment.id``) are scoped to one revision.
+    """
+
+    __tablename__ = "transcript_revisions"
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="ck_transcript_revisions_revision"),
+        CheckConstraint(_in("origin", TRANSCRIPT_ORIGINS), name="ck_transcript_revisions_origin"),
+        CheckConstraint(
+            _in("timing_level", TIMING_LEVELS), name="ck_transcript_revisions_timing_level"
+        ),
+        CheckConstraint(
+            "length(language) BETWEEN 2 AND 32", name="ck_transcript_revisions_language"
+        ),
+        CheckConstraint("duration_ms > 0", name="ck_transcript_revisions_duration"),
+        CheckConstraint(
+            "word_count >= 0 AND segment_count >= 0", name="ck_transcript_revisions_counts"
+        ),
+        CheckConstraint(
+            "timing_level = 'word' OR word_count = 0", name="ck_transcript_revisions_word_level"
+        ),
+        # An STT revision comes from a run, a correction from its parent revision; an import
+        # from neither.
+        CheckConstraint(
+            "(origin = 'stt') = (run_id IS NOT NULL) "
+            "AND (origin = 'correction') = (parent_id IS NOT NULL)",
+            name="ck_transcript_revisions_provenance",
+        ),
+        UniqueConstraint("source_id", "revision", name="uq_transcript_revisions_source_revision"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    source_id: Mapped[str] = mapped_column(ForeignKey("sources.id"), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    origin: Mapped[str] = mapped_column(String, nullable=False)
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("transcript_runs.id"), nullable=True)
+    parent_id: Mapped[str | None] = mapped_column(
+        ForeignKey("transcript_revisions.id"), nullable=True
+    )
+    timing_level: Mapped[str] = mapped_column(String, nullable=False)
+    language: Mapped[str] = mapped_column(String, nullable=False)
+    # Duration of the source the times are checked against: 0 <= start < end <= duration_ms.
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    word_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    segment_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Spans of {"start_ms", "end_ms", "state"}: which part of the source has text.
+    coverage: Mapped[list[dict[str, Any]]] = mapped_column(VersionedJson, nullable=False)
+    # How the revision came to be, e.g. {"format": "srt", "offset_ms": 0} (docs/05 section 7).
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(VersionedJson, nullable=False)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class TranscriptWord(Base):
+    """A word with source-relative time. ``id`` is unique within its revision only."""
+
+    __tablename__ = "transcript_words"
+    __table_args__ = (
+        CheckConstraint("ordinal >= 0", name="ck_transcript_words_ordinal"),
+        CheckConstraint("0 <= start_ms AND start_ms < end_ms", name="ck_transcript_words_interval"),
+        CheckConstraint("length(text) BETWEEN 1 AND 2000", name="ck_transcript_words_text"),
+        UniqueConstraint("revision_id", "ordinal", name="uq_transcript_words_revision_ordinal"),
+    )
+
+    revision_id: Mapped[str] = mapped_column(
+        ForeignKey("transcript_revisions.id"), primary_key=True
+    )
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    # The STT chunk the word came from; NULL for imported words.
+    chunk_id: Mapped[str | None] = mapped_column(ForeignKey("transcript_chunks.id"), nullable=True)
+    # Speaker label local to one chunk: never the same speaker across chunks (FR-017).
+    speaker_local: Mapped[str | None] = mapped_column(String, nullable=True)
+    # As the provider reported it; not a calibrated probability.
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class TranscriptSegment(Base):
+    """A segment (cue, sentence) with source-relative time. ``id`` is unique within its revision."""
+
+    __tablename__ = "transcript_segments"
+    __table_args__ = (
+        CheckConstraint("ordinal >= 0", name="ck_transcript_segments_ordinal"),
+        CheckConstraint(
+            "0 <= start_ms AND start_ms < end_ms", name="ck_transcript_segments_interval"
+        ),
+        CheckConstraint("length(text) BETWEEN 1 AND 2000", name="ck_transcript_segments_text"),
+        CheckConstraint(
+            _in("timing_level", TIMING_LEVELS), name="ck_transcript_segments_timing_level"
+        ),
+        UniqueConstraint("revision_id", "ordinal", name="uq_transcript_segments_revision_ordinal"),
+    )
+
+    revision_id: Mapped[str] = mapped_column(
+        ForeignKey("transcript_revisions.id"), primary_key=True
+    )
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Ids of the words of the same revision that belong to the segment; empty without words.
+    word_ids: Mapped[list[str]] = mapped_column(VersionedJson, nullable=False)
+    # Timing level of the revision the segment belongs to.
+    timing_level: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class AppSetting(Base):
+    """A non-secret application setting that differs from its default (FR-048).
+
+    ``value_json`` is never SQL NULL: a setting that goes back to its default loses its row. The
+    allowed keys and values belong to ``clipforge.services.settings``. Secrets are never stored.
+    """
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value_json: Mapped[Any] = mapped_column(VersionedJson, nullable=False)
+
+
+class SpendEntry(Base):
+    """A reservation and settlement of paid-request money (FR-049).
+
+    ``run_id`` has no foreign key: it names a transcription run now and an analysis run once that
+    table exists, and both spend against one ledger. ``state`` is one of ``SPEND_STATES``; the
+    transitions between them belong to ``clipforge.services.spend``.
+
+    Money is a whole number of micro-USD (1 USD = 1 000 000), never a float: the sums that are
+    compared with the budget ceiling must be exact. ``actual_micro_usd`` is NULL until the provider
+    reports a cost, and stays NULL when it never does.
+    """
+
+    __tablename__ = "spend_entries"
+    __table_args__ = (
+        CheckConstraint(_in("state", SPEND_STATES), name="ck_spend_entries_state"),
+        CheckConstraint("reserved_micro_usd >= 0", name="ck_spend_entries_reserved"),
+        CheckConstraint(
+            "actual_micro_usd IS NULL OR actual_micro_usd >= 0", name="ck_spend_entries_actual"
+        ),
+        UniqueConstraint("run_id", "request_id", name="uq_spend_entries_run_request"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    run_id: Mapped[str] = mapped_column(String, nullable=False)
+    request_id: Mapped[str] = mapped_column(String, nullable=False)
+    state: Mapped[str] = mapped_column(String, nullable=False)
+    reserved_micro_usd: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    actual_micro_usd: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    model: Mapped[str] = mapped_column(String, nullable=False)
+    # Prices the reservation was computed from; a later price change must not rewrite history.
+    price_snapshot: Mapped[dict[str, Any]] = mapped_column(VersionedJson, nullable=False)

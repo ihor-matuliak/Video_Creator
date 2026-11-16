@@ -104,13 +104,12 @@ describe('Sources tab: import', () => {
     );
   });
 
-  it('states that the video stays on this computer, without the transcription sentence (ADR 023)', async () => {
+  it('states that the video stays on this computer and that the chosen audio is sent for transcription (ADR 038)', async () => {
     await openSources(() => imported(makeSource()));
 
-    expect(screen.getByText("Відео залишається на цьому комп'ютері.")).toBeVisible();
-    // The sentence about the audio sent for transcription comes in M3, with the transcription.
-    expect(screen.queryByText(/Для транскрипції/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/надсилається вибране аудіо/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Відео залишається на цьому комп'ютері. Для транскрипції надсилається вибране аудіо."),
+    ).toBeVisible();
   });
 
   it('shows a loading status and blocks a second import while the first is running', async () => {

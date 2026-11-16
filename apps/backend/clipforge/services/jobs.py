@@ -57,17 +57,25 @@ class JobView:
 
 
 JobCanceller = Callable[[str], JobView]
+JobResumer = Callable[[str, bool, str | None], JobView]
+"""``(job_id, retry_unknown, budget_usd)``: the job again, queued. ``budget_usd`` is the new budget
+ceiling of the run, ``None`` to keep the one the job has."""
 
 
 class JobService:
     """``cancellers`` maps a job type to the function that cancels jobs of that type; a type
-    without one cannot be cancelled."""
+    without one cannot be cancelled. ``resumers`` does the same for ``resume`` (only jobs that
+    keep a checkpoint a later attempt can continue from have one)."""
 
     def __init__(
-        self, database: Database, cancellers: Mapping[str, JobCanceller] | None = None
+        self,
+        database: Database,
+        cancellers: Mapping[str, JobCanceller] | None = None,
+        resumers: Mapping[str, JobResumer] | None = None,
     ) -> None:
         self._database = database
         self._cancellers = dict(cancellers or {})
+        self._resumers = dict(resumers or {})
 
     def get(self, job_id: str) -> JobView:
         with self._database.session() as session:
@@ -86,6 +94,19 @@ class JobService:
         if canceller is None:
             raise conflict("JOB_NOT_CANCELLABLE", "Це завдання не можна скасувати")
         return canceller(job_id)
+
+    def resume(
+        self, job_id: str, *, retry_unknown: bool = False, budget_usd: str | None = None
+    ) -> JobView:
+        """Ask the owner of the job's type to continue it from its checkpoint (docs/04 s. 5)."""
+        with self._database.session() as session:
+            job = JobRepository(session).get(job_id)
+            if job is None:
+                raise not_found("JOB_NOT_FOUND", "Завдання не знайдено")
+            resumer = self._resumers.get(job.type)
+        if resumer is None:
+            raise conflict("JOB_NOT_RESUMABLE", "Це завдання не можна відновити")
+        return resumer(job_id, retry_unknown, budget_usd)
 
 
 def job_view(job: Job) -> JobView:

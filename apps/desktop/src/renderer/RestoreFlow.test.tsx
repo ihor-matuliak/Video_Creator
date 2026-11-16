@@ -141,8 +141,9 @@ describe('Project: the sources of earlier runs', () => {
       { project_id: PROJECT_ID },
       { project_id: PROJECT_ID, cursor: 'page-2' },
     ]);
-    // The last source is the one shown, like after an import.
-    expect(within(screen.getByTestId('source-ready')).getByRole('heading')).toHaveTextContent(
+    // The last source is the one shown, like after an import. Level 3: the inspector has a heading of
+    // its own and, below it, the one of the speech-recognition block.
+    expect(within(screen.getByTestId('source-ready')).getByRole('heading', { level: 3 })).toHaveTextContent(
       'третя.mp4',
     );
   });

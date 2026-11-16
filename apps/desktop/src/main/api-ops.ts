@@ -5,8 +5,8 @@ import {
   isUuid4,
   isVideoToken,
 } from '../shared/api';
-import type { ApiOp, ApiParams, ExportProfile, ReviewStatus } from '../shared/api';
-import type { ImportVideoParams, OpenFolderParams } from '../shared/bridge';
+import type { ApiOp, ApiParams, ExportProfile, ReviewStatus, TranscriptEdit } from '../shared/api';
+import type { ImportTranscriptParams, ImportVideoParams, OpenFolderParams } from '../shared/bridge';
 import type { ApiMethod } from './sidecar-protocol';
 
 /**
@@ -16,8 +16,10 @@ import type { ApiMethod } from './sidecar-protocol';
  * in a URL has passed the uuid4 check. The op itself is looked up only after
  * `isApiOp`, never as a property of renderer-controlled data.
  *
- * Checks are about shape only (types, IDs, sizes); domain rules and bounds stay
- * with the backend, which answers 422 with a code.
+ * Checks are about shape only (types, IDs, sizes); domain rules stay with the
+ * backend, which answers 422 with a code. The numbers named in ADR 038 and 039
+ * (window `limit` 1–1000, `offset` ≥ 0, 1–500 edits, the run budget format) are
+ * checked here as well, so an out-of-range value never reaches the sidecar.
  */
 
 /** A call the gateway will make on the sidecar. */
@@ -46,6 +48,17 @@ const MAX_TEXT_LENGTH = 1_000;
 const MAX_LIST_ITEMS = 1_000;
 /** GET /v1/sources accepts limit 1..100 (ADR 023). */
 const SOURCES_PAGE_SIZE = 100;
+/** Window of GET /v1/transcripts/{id}: `offset` 0 or more, `limit` 1..1000 (ADR 030, 039). */
+const MAX_WINDOW_OFFSET = 2 ** 31 - 1;
+const MAX_WINDOW_LIMIT = 1_000;
+/** POST /v1/transcripts/{id}/corrections takes 1..500 edits (FR-020, ADR 039). */
+const MAX_TRANSCRIPT_EDITS = 500;
+/** A word or segment ID of a transcript is at most 2000 characters (contracts/transcript.schema.json). */
+const MAX_TRANSCRIPT_ITEM_ID = 2_000;
+/** The run budget as the settings check it (ADR 033): 0.01 to 1000 USD. */
+const RUN_BUDGET_MIN_USD = 0.01;
+const RUN_BUDGET_MAX_USD = 1_000;
+const RUN_BUDGET_PATTERN = /^(?:0|[1-9][0-9]{0,3})(?:\.[0-9]{1,6})?$/;
 
 type Check<T> = (value: unknown) => T;
 
@@ -96,6 +109,74 @@ const str: Check<string> = (value) =>
   typeof value === 'string' && value.length <= MAX_TEXT_LENGTH ? value : invalid();
 const reviewStatus: Check<ReviewStatus> = (value) =>
   REVIEW_STATUSES.find((status) => status === value) ?? invalid();
+
+/** An integer from `min` to `max`, both included; a float, a numeric string or null is refused. */
+function intIn(min: number, max: number): Check<number> {
+  return (value) =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max
+      ? value
+      : invalid();
+}
+
+const windowOffset = intIn(0, MAX_WINDOW_OFFSET);
+const windowLimit = intIn(1, MAX_WINDOW_LIMIT);
+
+/** The 32-bit range of `offset_ms` of POST /v1/transcripts/import (ADR 039). */
+const MAX_TRANSCRIPT_OFFSET_MS = 2 ** 31 - 1;
+const transcriptOffsetMs = intIn(-MAX_TRANSCRIPT_OFFSET_MS, MAX_TRANSCRIPT_OFFSET_MS);
+
+/**
+ * A run budget in the form of the settings' `run_budget_usd` (ADR 033, 038): a decimal string with
+ * at most six digits after the point, from 0.01 to 1000. Not a number, and not null: an absent
+ * budget is a missing key, not a null. The bounds are compared as doubles, which is exact enough
+ * here: a string with at most six decimals is never closer to a bound than the rounding error.
+ */
+const runBudget: Check<string> = (value) => {
+  if (typeof value !== 'string' || !RUN_BUDGET_PATTERN.test(value)) {
+    return invalid();
+  }
+  const amount = Number(value);
+  return amount >= RUN_BUDGET_MIN_USD && amount <= RUN_BUDGET_MAX_USD ? value : invalid();
+};
+
+/**
+ * A word or segment ID of a transcript. These are the document's own IDs (a normalized import keeps
+ * them, ADR 030), not uuid4s, so the check is only: a non-empty string of at most 2000 characters.
+ * The UTF-16 length is checked first, so a huge string is not split into code points.
+ */
+const transcriptItemId: Check<string> = (value) =>
+  typeof value === 'string' &&
+  value.length > 0 &&
+  value.length <= MAX_TRANSCRIPT_ITEM_ID * 2 &&
+  Array.from(value).length <= MAX_TRANSCRIPT_ITEM_ID
+    ? value
+    : invalid();
+
+/** The text of an edit: a string that is not blank after trim. Its length is the backend's to check. */
+const editText: Check<string> = (value) =>
+  typeof value === 'string' && value.trim() !== '' ? value : invalid();
+
+/**
+ * One edit, exactly one of `word_id` and `segment_id` with its `text`, and no other key. An
+ * absent key is `undefined`; a `null` ID is refused like any other non-string.
+ */
+function transcriptEdit(value: unknown): TranscriptEdit {
+  const source = exact(value, ['text'], ['word_id', 'segment_id']);
+  const byWord = source.word_id !== undefined;
+  if (byWord === (source.segment_id !== undefined)) {
+    return invalid();
+  }
+  const text = editText(source.text);
+  return byWord
+    ? { word_id: transcriptItemId(source.word_id), text }
+    : { segment_id: transcriptItemId(source.segment_id), text };
+}
+
+/** 1 to 500 edits, each checked by `transcriptEdit`. A hole in the array is an invalid edit. */
+const transcriptEdits: Check<TranscriptEdit[]> = (value) =>
+  Array.isArray(value) && value.length >= 1 && value.length <= MAX_TRANSCRIPT_EDITS
+    ? Array.from(value, (edit: unknown) => transcriptEdit(edit))
+    : invalid();
 /**
  * The project search text: at most 200 characters. They are counted as code points, like the
  * backend's `max_length`; the cheap UTF-16 bound first keeps a huge string from being split.
@@ -362,6 +443,147 @@ const BUILDERS: Readonly<Record<ApiOp, Builder>> = {
     },
     () => ({ method: 'GET', path: '/v1/system/checks' }),
   ),
+
+  // ADR 033: the four non-secret settings. The API key is not one of them and never takes this
+  // route (`ApiKeyService`); any other key in the params is refused here, not forwarded.
+  'settings.get': define<ApiParams['settings.get']>(
+    (raw) => {
+      exact(raw, []);
+      return {};
+    },
+    () => ({ method: 'GET', path: '/v1/settings' }),
+  ),
+
+  // ADR 038: `jobs.resume` takes the user's decision to send again requests whose outcome is
+  // unknown. `budget_usd` (ADR 038, доповнення 2) replaces the run's ceiling, checked like the
+  // setting; without it the ceiling stays as it was.
+  'jobs.resume': define<ApiParams['jobs.resume']>(
+    (raw) => {
+      const p = exact(raw, ['id'], ['retry_unknown', 'budget_usd']);
+      return {
+        id: uuid(p.id),
+        retry_unknown: optional(p.retry_unknown, bool),
+        budget_usd: optional(p.budget_usd, runBudget),
+      };
+    },
+    (p) => ({
+      method: 'POST',
+      path: `/v1/jobs/${p.id}/resume`,
+      body: defined({ retry_unknown: p.retry_unknown, budget_usd: p.budget_usd }),
+    }),
+  ),
+
+  // ADR 038: the model, the language and the budget are not params; the backend takes them from
+  // the settings, so a run always matches the Settings screen. No key goes through these ops.
+  'transcription.estimate': define<ApiParams['transcription.estimate']>(
+    (raw) => {
+      const p = exact(raw, ['source_id', 'audio_stream_index']);
+      return { source_id: uuid(p.source_id), audio_stream_index: int(p.audio_stream_index) };
+    },
+    (p) => ({
+      method: 'POST',
+      path: '/v1/transcription-runs/estimate',
+      body: { source_id: p.source_id, audio_stream_index: p.audio_stream_index },
+    }),
+  ),
+
+  'transcription.create': define<ApiParams['transcription.create']>(
+    (raw) => {
+      const p = exact(raw, ['source_id', 'audio_stream_index'], ['force']);
+      return {
+        source_id: uuid(p.source_id),
+        audio_stream_index: int(p.audio_stream_index),
+        force: optional(p.force, bool),
+      };
+    },
+    (p) => ({
+      method: 'POST',
+      path: '/v1/transcription-runs',
+      body: defined({
+        source_id: p.source_id,
+        audio_stream_index: p.audio_stream_index,
+        force: p.force,
+      }),
+    }),
+  ),
+
+  'transcription.get': define<ApiParams['transcription.get']>(
+    (raw) => ({ id: uuid(exact(raw, ['id']).id) }),
+    (p) => ({ method: 'GET', path: `/v1/transcription-runs/${p.id}` }),
+  ),
+
+  'transcription.list': define<ApiParams['transcription.list']>(
+    (raw) => ({ source_id: uuid(exact(raw, ['source_id']).source_id) }),
+    (p) => ({ method: 'GET', path: withQuery('/v1/transcription-runs', { source_id: p.source_id }) }),
+  ),
+
+  // ADR 039: the revisions of one source, oldest first. The page size is the backend's; the
+  // renderer follows the opaque cursor only.
+  'transcripts.list': define<ApiParams['transcripts.list']>(
+    (raw) => {
+      const p = exact(raw, ['source_id'], ['cursor']);
+      return { source_id: uuid(p.source_id), cursor: optional(p.cursor, str) };
+    },
+    (p) => ({
+      method: 'GET',
+      path: withQuery('/v1/transcripts', { source_id: p.source_id, cursor: p.cursor }),
+    }),
+  ),
+
+  // ADR 039: one revision with a window of its segments and words (ADR 030). Both bounds are the
+  // backend's: `offset` 0 or more, `limit` 1 to 1000; the defaults are the backend's too.
+  'transcripts.get': define<ApiParams['transcripts.get']>(
+    (raw) => {
+      const p = exact(raw, ['id'], ['offset', 'limit']);
+      return {
+        id: uuid(p.id),
+        offset: optional(p.offset, windowOffset),
+        limit: optional(p.limit, windowLimit),
+      };
+    },
+    (p) => ({
+      method: 'GET',
+      path: withQuery(`/v1/transcripts/${p.id}`, { offset: p.offset, limit: p.limit }),
+    }),
+  ),
+
+  // FR-020, ADR 039: one correction, a new revision. The renderer names the words or segments it
+  // changes and their new text; the backend checks the IDs against the revision and decides the rest.
+  'transcripts.correct': define<ApiParams['transcripts.correct']>(
+    (raw) => {
+      const p = exact(raw, ['id', 'edits']);
+      return { id: uuid(p.id), edits: transcriptEdits(p.edits) };
+    },
+    (p) => ({
+      method: 'POST',
+      path: `/v1/transcripts/${p.id}/corrections`,
+      body: { edits: p.edits },
+    }),
+  ),
+
+  // ADR 039: the key check takes no params. The key is held by the sidecar and never sent by
+  // the renderer or sent back to it: this op carries neither.
+  'credentials.check': define<ApiParams['credentials.check']>(
+    (raw) => {
+      exact(raw, []);
+      return {};
+    },
+    () => ({ method: 'POST', path: '/v1/runtime/credentials/check' }),
+  ),
+
+  'settings.update': define<ApiParams['settings.update']>(
+    (raw) => {
+      const p = exact(raw, [], ['stt_model', 'stt_language', 'analysis_model', 'run_budget_usd']);
+      return {
+        // The default of the model is explicit, so it cannot be reset to null (ADR 033).
+        stt_model: optional(p.stt_model, str),
+        stt_language: optional(p.stt_language, nullable(str)),
+        analysis_model: optional(p.analysis_model, nullable(str)),
+        run_budget_usd: optional(p.run_budget_usd, nullable(str)),
+      };
+    },
+    (p) => ({ method: 'PATCH', path: '/v1/settings', body: defined(p) }),
+  ),
 };
 
 /** The `api:call` payload: exactly `{ op, params? }`. `op` is checked by the caller. */
@@ -380,6 +602,17 @@ export function parseImportParams(value: unknown): ImportVideoParams {
   return fileToken === undefined
     ? { project_id: uuid(source.project_id) }
     : { project_id: uuid(source.project_id), file_token: fileToken };
+}
+
+/**
+ * Params of `dialog:import-transcript`: the source and the offset of the file's times, nothing
+ * else. The file is chosen in the dialog, so no path or text is among the params.
+ */
+export function parseImportTranscriptParams(value: unknown): ImportTranscriptParams {
+  const source = exact(value, ['source_id'], ['offset_ms']);
+  const sourceId = uuid(source.source_id);
+  const offset = optional(source.offset_ms, transcriptOffsetMs);
+  return offset === undefined ? { source_id: sourceId } : { source_id: sourceId, offset_ms: offset };
 }
 
 /**

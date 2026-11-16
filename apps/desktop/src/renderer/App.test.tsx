@@ -30,19 +30,20 @@ describe('App shell when the backend is ready', () => {
       'page',
     );
     expect(within(nav).getByRole('button', { name: 'Черга' })).toBeDisabled();
-    expect(within(nav).getByRole('button', { name: 'Налаштування' })).toBeDisabled();
+    expect(within(nav).getByRole('button', { name: 'Налаштування' })).toBeEnabled();
   });
 
-  it('explains why Queue and Settings are unavailable, next to the buttons', async () => {
+  it('explains why the Queue is unavailable, next to its button', async () => {
     installStatus(READY);
     render(<App />);
     const nav = await screen.findByRole('navigation', { name: 'Основна навігація' });
 
-    for (const name of ['Черга', 'Налаштування']) {
-      expect(within(nav).getByRole('button', { name })).toHaveAccessibleDescription(
-        'Розділи «Черга» і «Налаштування» ще недоступні.',
-      );
-    }
+    expect(within(nav).getByRole('button', { name: 'Черга' })).toHaveAccessibleDescription(
+      'Розділ «Черга» ще недоступний.',
+    );
+    expect(within(nav).getByRole('button', { name: 'Налаштування' })).not.toHaveAttribute(
+      'aria-describedby',
+    );
   });
 
   it('collapses the sidebar and expands it again without losing the labels', async () => {

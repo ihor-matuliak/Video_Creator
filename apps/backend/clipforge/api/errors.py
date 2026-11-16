@@ -25,12 +25,14 @@ _HTTP_ERRORS: dict[int, tuple[str, str]] = {
     404: ("NOT_FOUND", "Ресурс не знайдено"),
     405: ("METHOD_NOT_ALLOWED", "Метод не підтримується для цього ресурсу"),
 }
-# docs/04 section 4: 400 domain action, 404 id, 409 conflict, 422 schema/bounds, 503 dependency.
+# docs/04 section 4: 400 domain action, 404 id, 409 conflict, 422 schema/bounds, 429 local
+# limit, 503 dependency.
 _SERVICE_ERROR_STATUS: dict[ErrorKind, int] = {
     ErrorKind.BAD_REQUEST: 400,
     ErrorKind.NOT_FOUND: 404,
     ErrorKind.CONFLICT: 409,
     ErrorKind.INVALID: 422,
+    ErrorKind.LIMIT_EXCEEDED: 429,
     ErrorKind.UNAVAILABLE: 503,
 }
 

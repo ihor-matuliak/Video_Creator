@@ -16,10 +16,12 @@ import type { SaveStatus } from './save-status';
 import { SourcePlayer } from './SourcePlayer';
 import type { PlayerHandle } from './SourcePlayer';
 import { Splitter } from './Splitter';
+import { TranscriptPanel } from './TranscriptPanel';
 import { useClipEditing } from './use-clip-editing';
 import type { Bound } from './use-clip-editing';
 import { useClipQueue } from './use-clip-queue';
 import { useMomentsPanels, useWideLayout } from './use-moments-panels';
+import { useViewActive } from './view-active';
 
 /** A guard against a backend that keeps returning a cursor. */
 const MAX_PAGES = 100;
@@ -157,8 +159,9 @@ interface SourceWorkspaceProps {
 }
 
 /**
- * The workspace of one source. It exists only while the Моменти tab is open, which is what
- * limits the keyboard shortcuts to it: the listener lives and dies with this component.
+ * The workspace of one source. It exists only while the Моменти tab is open, and the shortcuts
+ * work only while the project is on screen (not under «Налаштування»): the listener lives and
+ * dies with this component, and ignores keys while the project is hidden.
  */
 function SourceWorkspace({
   source,
@@ -172,6 +175,7 @@ function SourceWorkspace({
 }: SourceWorkspaceProps) {
   const playerRef = useRef<PlayerHandle>(null);
   const formRef = useRef<ManualClipFormHandle>(null);
+  const viewActive = useViewActive();
   const [playerReady, setPlayerReady] = useState(false);
   const [formOpen, setFormOpen] = useState(startWithForm);
   const [focusRequest, setFocusRequest] = useState(0);
@@ -184,7 +188,7 @@ function SourceWorkspace({
   const [reviewErrors, setReviewErrors] = useState<Readonly<Record<string, string | undefined>>>({});
   const [activeClipId, setActiveClipId] = useState<string | null>(null);
   const [nothingToReview, setNothingToReview] = useState(false);
-  // Below 1440 px the right panel is two tabs under the player; this one is open.
+  // Below 1440 px the right panel is tabs under the player; this one is open.
   const [detailsTab, setDetailsTab] = useState<DetailsTabId>('edit');
   const wide = useWideLayout();
   const { attachGrid, attachList, attachDetails, style: panelStyle, control: panelControl } =
@@ -416,7 +420,8 @@ function SourceWorkspace({
   };
 
   const handleKeyDown = (event: KeyboardEvent): void => {
-    if (event.defaultPrevented || event.isComposing) {
+    // A project under «Налаштування» is still mounted: its shortcuts must not act on it from there.
+    if (!viewActive || event.defaultPrevented || event.isComposing) {
       return;
     }
     const hotkey = hotkeyOf(event);
@@ -506,6 +511,18 @@ function SourceWorkspace({
       Клавіші: Пробіл — грати/пауза, I і O — початок і кінець тут, A і R — підтвердити і відхилити, J і L — назад і
       вперед на 1 с, Ctrl+Z — скасувати зміну меж. Не діють, поки курсор у полі.
     </p>
+  );
+
+  // The transcript of the source the clips belong to (ADR 039): search, «Виправити»; a time in it seeks the player.
+  // Keyed by the source: its search and its correction editor start afresh for each source.
+  const transcript = (
+    <TranscriptPanel
+      key={source.id}
+      sourceId={source.id}
+      onSeek={(ms) => {
+        playerRef.current?.seekTo(ms);
+      }}
+    />
   );
 
   // One grid in both arrangements: from 1440 px the right panel is the third column, below it
@@ -601,6 +618,7 @@ function SourceWorkspace({
         onChange={setDetailsTab}
         edit={editor}
         keys={hotkeysHint}
+        transcript={transcript}
       />
     </div>
   );

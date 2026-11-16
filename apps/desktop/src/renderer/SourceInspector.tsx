@@ -1,6 +1,15 @@
-import type { AudioStreamDto, SourceDto } from '../shared/api';
+import type { SourceDto } from '../shared/api';
 import { formatTimecode } from '../shared/timecode';
-import { NOT_KNOWN, describePlayback, formatFrameRate, formatResolution, vfrBadge } from './source-format';
+import {
+  NOT_KNOWN,
+  describePlayback,
+  describeTrack,
+  formatFrameRate,
+  formatResolution,
+  vfrBadge,
+} from './source-format';
+import { TranscriptImport } from './TranscriptImport';
+import { TranscriptionPanel } from './TranscriptionPanel';
 import { StatusText } from './ui';
 import type { Tone } from './ui';
 
@@ -25,17 +34,6 @@ const UNKNOWN: Label = { tone: 'warning', text: 'Невідомо' };
 
 function labelFor(table: Readonly<Record<string, Label>>, value: string): Label {
   return Object.hasOwn(table, value) ? (table[value] ?? UNKNOWN) : UNKNOWN;
-}
-
-function describeTrack(stream: AudioStreamDto): string {
-  const parts = [
-    stream.language,
-    stream.title,
-    stream.channels === null ? null : `${String(stream.channels)} кан.`,
-    stream.codec === '' ? null : stream.codec.toUpperCase(),
-    stream.default ? 'за замовчуванням' : null,
-  ].filter((part): part is string => part !== null && part !== '');
-  return parts.length === 0 ? `Доріжка ${String(stream.index)}` : `Доріжка ${String(stream.index)} · ${parts.join(' · ')}`;
 }
 
 /** What the user needs to know about one registered source (docs/03 section 5). */
@@ -103,8 +101,10 @@ export function SourceInspector({ source }: { readonly source: SourceDto }) {
         </div>
       </dl>
       <p className="note" data-testid="source-local-note">
-        Відео залишається на цьому комп&apos;ютері.
+        Відео залишається на цьому комп&apos;ютері. Для транскрипції надсилається вибране аудіо.
       </p>
+      <TranscriptionPanel key={source.id} source={source} availability={source.availability} />
+      <TranscriptImport key={source.id} sourceId={source.id} />
     </section>
   );
 }

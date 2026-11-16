@@ -46,15 +46,204 @@ describe('the exposed bridge', () => {
       'bridgeVersion',
       'call',
       'chooseExportFolder',
+      'forgetApiKey',
+      'getApiKeyStatus',
       'getStatus',
       'getViewState',
+      'importTranscript',
       'importVideo',
       'openExportFolder',
       'pickVideo',
+      'setApiKey',
       'setViewState',
       'takeDroppedVideo',
     ]);
     expect(bridge.bridgeVersion).toBe(2);
+  });
+});
+
+const KEY = 'sk-or-v1-0123456789abcdefghij';
+
+describe('the OpenRouter key (ADR 034)', () => {
+  it('setApiKey sends the key on its own channel only, never on api:call, and answers the status', async () => {
+    electron.invoke.mockResolvedValueOnce({ ok: true, data: { state: 'protected', message: null } });
+
+    const result = await bridge.setApiKey(KEY);
+
+    expect(electron.invoke.mock.calls).toEqual([['settings:set-api-key', KEY]]);
+    expect(result).toEqual({ ok: true, data: { state: 'protected', message: null } });
+    expect(JSON.stringify(result)).not.toContain(KEY);
+  });
+
+  it('does not hand on the key, even one that main sent along by mistake', async () => {
+    electron.invoke.mockResolvedValueOnce({
+      ok: true,
+      data: { state: 'session', message: null, key: KEY, openrouter_api_key: KEY },
+      key: KEY,
+    });
+    electron.invoke.mockResolvedValueOnce({ state: 'none', message: null, key: KEY });
+
+    const answers = [await bridge.setApiKey(KEY), await bridge.getApiKeyStatus()];
+
+    expect(JSON.stringify(answers)).not.toContain(KEY);
+    expect(answers).toEqual([
+      { ok: true, data: { state: 'session', message: null } },
+      { state: 'none', message: null },
+    ]);
+  });
+
+  it('setApiKey passes an error through and refuses anything but a string before any IPC', async () => {
+    electron.invoke.mockResolvedValueOnce({
+      ok: false,
+      error: { code: 'INVALID_API_KEY', message: 'Ключ має…', retryable: false },
+    });
+
+    expect(await bridge.setApiKey('short')).toEqual({
+      ok: false,
+      error: { code: 'INVALID_API_KEY', message: 'Ключ має…', retryable: false },
+    });
+    electron.invoke.mockClear();
+    for (const value of [undefined, null, 5, { key: KEY }, [KEY]]) {
+      await expect(bridge.setApiKey(value as unknown as string)).rejects.toThrow(TypeError);
+    }
+    expect(electron.invoke).not.toHaveBeenCalled();
+  });
+
+  it('forgetApiKey and getApiKeyStatus take no argument and answer the status', async () => {
+    electron.invoke.mockResolvedValueOnce({ ok: true, data: { state: 'none', message: null } });
+    electron.invoke.mockResolvedValueOnce({ state: 'none', message: 'Не вдалося прочитати' });
+
+    expect(await bridge.forgetApiKey()).toEqual({ ok: true, data: { state: 'none', message: null } });
+    expect(await bridge.getApiKeyStatus()).toEqual({ state: 'none', message: 'Не вдалося прочитати' });
+    expect(electron.invoke.mock.calls).toEqual([
+      ['settings:forget-api-key'],
+      ['settings:get-api-key-status'],
+    ]);
+  });
+
+  it('rejects an answer of another shape and names the channel', async () => {
+    for (const answer of [undefined, null, {}, { ok: true, data: { state: 'maybe', message: null } }]) {
+      electron.invoke.mockResolvedValueOnce(answer);
+
+      await expect(bridge.setApiKey(KEY)).rejects.toThrow('settings:set-api-key');
+    }
+    electron.invoke.mockResolvedValueOnce({ state: 'maybe', message: null });
+    await expect(bridge.getApiKeyStatus()).rejects.toThrow('settings:get-api-key-status');
+  });
+
+  it('call sends settings.get and settings.update on api:call and reads the settings back', async () => {
+    const settings = {
+      stt_model: 'microsoft/mai-transcribe-2',
+      stt_language: null,
+      analysis_model: null,
+      run_budget_usd: '2.50',
+      has_api_key: true,
+    };
+    electron.invoke.mockResolvedValueOnce({ ok: true, data: { ...settings, extra: 1 } });
+    electron.invoke.mockResolvedValueOnce({ ok: true, data: settings });
+
+    expect(await bridge.call('settings.get', {})).toEqual({ ok: true, data: settings });
+    expect(await bridge.call('settings.update', { run_budget_usd: '2.50' })).toEqual({
+      ok: true,
+      data: settings,
+    });
+    expect(electron.invoke.mock.calls).toEqual([
+      ['api:call', { op: 'settings.get', params: {} }],
+      ['api:call', { op: 'settings.update', params: { run_budget_usd: '2.50' } }],
+    ]);
+  });
+});
+
+describe('transcription ops and jobs.resume (ADR 038)', () => {
+  const estimate = {
+    source_id: ID,
+    audio_stream_index: 1,
+    model: 'microsoft/mai-transcribe-2',
+    language: null,
+    duration_ms: 125_000,
+    chunk_count: 1,
+    billed_seconds: 125,
+    usd_per_second_upper: '0.0001',
+    estimate_micro_usd: 12_500,
+    price_basis: 'upper_bound_per_second',
+    budget_usd: null,
+    within_budget: null,
+    existing: { transcript_id: ID, run_id: ID },
+  };
+  const item = {
+    id: ID,
+    source_id: ID,
+    job_id: ID,
+    model: 'microsoft/mai-transcribe-2',
+    status: 'completed',
+    revision_id: ID,
+    error_code: null,
+    committed_micro_usd: 12_500,
+    created_at: '2026-11-16T10:00:00Z',
+  };
+  const run = {
+    id: ID,
+    source_id: ID,
+    job_id: ID,
+    model: 'microsoft/mai-transcribe-2',
+    status: 'running',
+    revision_id: null,
+    error_code: null,
+    committed_micro_usd: 0,
+    chunks: [
+      { id: ID, core_start_ms: 0, core_end_ms: 60_000, state: 'running', attempts: 1, error_code: null },
+    ],
+  };
+  const job = { id: ID, type: 'transcription', state: 'queued', progress: {}, error: null };
+
+  it('call sends each op on api:call with its params and reads the answer back', async () => {
+    electron.invoke.mockResolvedValueOnce({ ok: true, data: { ...estimate, extra: 1 } });
+    electron.invoke.mockResolvedValueOnce({ ok: true, data: { id: ID, job_id: ID, status: 'queued' } });
+    electron.invoke.mockResolvedValueOnce({ ok: true, data: { ...run, extra: 1 } });
+    electron.invoke.mockResolvedValueOnce({ ok: true, data: { items: [item] } });
+    electron.invoke.mockResolvedValueOnce({ ok: true, data: job });
+
+    const results = [
+      await bridge.call('transcription.estimate', { source_id: ID, audio_stream_index: 1 }),
+      await bridge.call('transcription.create', { source_id: ID, audio_stream_index: 1, force: true }),
+      await bridge.call('transcription.get', { id: ID }),
+      await bridge.call('transcription.list', { source_id: ID }),
+      await bridge.call('jobs.resume', { id: ID, retry_unknown: true }),
+    ];
+
+    expect(electron.invoke.mock.calls).toEqual([
+      ['api:call', { op: 'transcription.estimate', params: { source_id: ID, audio_stream_index: 1 } }],
+      [
+        'api:call',
+        { op: 'transcription.create', params: { source_id: ID, audio_stream_index: 1, force: true } },
+      ],
+      ['api:call', { op: 'transcription.get', params: { id: ID } }],
+      ['api:call', { op: 'transcription.list', params: { source_id: ID } }],
+      ['api:call', { op: 'jobs.resume', params: { id: ID, retry_unknown: true } }],
+    ]);
+    expect(results).toEqual([
+      { ok: true, data: estimate },
+      { ok: true, data: { id: ID, job_id: ID, status: 'queued' } },
+      { ok: true, data: run },
+      { ok: true, data: { items: [item] } },
+      { ok: true, data: job },
+    ]);
+  });
+
+  it('call rejects an answer of another shape for each op', async () => {
+    const cases = [
+      ['transcription.estimate', { source_id: ID, audio_stream_index: 1 }, { ...estimate, within_budget: 'yes' }],
+      ['transcription.create', { source_id: ID, audio_stream_index: 1 }, { id: ID, job_id: 5, status: 'queued' }],
+      ['transcription.get', { id: ID }, { ...run, chunks: 'none' }],
+      ['transcription.list', { source_id: ID }, { items: [{ ...item, committed_micro_usd: '1' }] }],
+      ['jobs.resume', { id: ID }, { ...job, error: { code: 'X' } }],
+    ] as const;
+
+    for (const [op, params, data] of cases) {
+      electron.invoke.mockResolvedValueOnce({ ok: true, data });
+
+      await expect(bridge.call(op, params as never), op).rejects.toThrow(TypeError);
+    }
   });
 });
 
@@ -240,5 +429,84 @@ describe('importVideo and system.checks', () => {
     electron.invoke.mockResolvedValueOnce({ ok: true, data: { ffmpeg: { ok: true, version: null } } });
 
     await expect(bridge.call('system.checks', {})).rejects.toThrow(TypeError);
+  });
+});
+
+describe('importTranscript (ADR 039)', () => {
+  const REVISION = {
+    id: ID,
+    source_id: ID,
+    revision: 1,
+    origin: 'import',
+    run_id: null,
+    parent_id: null,
+    timing_level: 'segment',
+    language: 'uk',
+    duration_ms: 12000,
+    word_count: 0,
+    segment_count: 1,
+    coverage: [{ start_ms: 0, end_ms: 12000, state: 'succeeded' }],
+    created_at: '2026-11-16T10:00:00Z',
+  };
+
+  it('sends the params as they are on dialog:import-transcript and reads the revision back', async () => {
+    electron.invoke.mockResolvedValueOnce({
+      ok: true,
+      data: { ...REVISION, metadata: { provider: 'import' } },
+    });
+
+    const result = await bridge.importTranscript({ source_id: ID, offset_ms: 1500 });
+
+    expect(electron.invoke.mock.calls).toEqual([
+      ['dialog:import-transcript', { source_id: ID, offset_ms: 1500 }],
+    ]);
+    expect(result).toEqual({ ok: true, data: REVISION });
+  });
+
+  it('answers a cancel as a cancel and an error as an error', async () => {
+    electron.invoke.mockResolvedValueOnce({ canceled: true });
+    expect(await bridge.importTranscript({ source_id: ID })).toEqual({ canceled: true });
+
+    const failure = {
+      ok: false,
+      error: {
+        code: 'TRANSCRIPT_FILE_TOO_LARGE',
+        message: 'Файл субтитрів більший за 20 МБ',
+        retryable: false,
+      },
+    };
+    electron.invoke.mockResolvedValueOnce(failure);
+    expect(await bridge.importTranscript({ source_id: ID })).toEqual(failure);
+  });
+
+  it('never hands on a path or the text of the file, even when main sent them along', async () => {
+    electron.invoke.mockResolvedValueOnce({
+      ok: true,
+      data: { ...REVISION, path: DROPPED, text: 'Таємний текст' },
+    });
+
+    const result = await bridge.importTranscript({ source_id: ID });
+
+    expect(result).toEqual({ ok: true, data: REVISION });
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain('clip.mp4');
+    expect(serialized).not.toContain('Таємний');
+    expect(serialized).not.toContain('Users');
+  });
+
+  it('keeps a cancel exact and drops any other key of it', async () => {
+    electron.invoke.mockResolvedValueOnce({ canceled: true, path: DROPPED });
+
+    expect(await bridge.importTranscript({ source_id: ID })).toEqual({ canceled: true });
+  });
+
+  it('rejects an answer of another shape and names the channel', async () => {
+    electron.invoke.mockResolvedValueOnce({ canceled: 'yes' });
+    await expect(bridge.importTranscript({ source_id: ID })).rejects.toThrow(
+      'dialog:import-transcript',
+    );
+
+    electron.invoke.mockResolvedValueOnce({ ok: true, data: { id: ID } });
+    await expect(bridge.importTranscript({ source_id: ID })).rejects.toThrow(TypeError);
   });
 });

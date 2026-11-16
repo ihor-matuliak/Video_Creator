@@ -129,8 +129,8 @@ describe('tabs under the player below 1440 px', () => {
     expect(screen.queryByRole('separator', { name: 'Ширина панелі фрагмента' })).not.toBeInTheDocument();
     expect(screen.getByTestId('details-panel')).toHaveAttribute('data-tabbed', 'true');
     const tabs = within(screen.getByRole('tablist', { name: 'Вкладки панелі фрагмента' })).getAllByRole('tab');
-    expect(tabs.map((tab) => tab.textContent)).toEqual(['Межі', 'Клавіші']);
-    expect(tabs.map((tab) => tab.getAttribute('aria-selected'))).toEqual(['true', 'false']);
+    expect(tabs.map((tab) => tab.textContent)).toEqual(['Межі', 'Клавіші', 'Транскрипція']);
+    expect(tabs.map((tab) => tab.getAttribute('aria-selected'))).toEqual(['true', 'false', 'false']);
   });
 
   it('shows the editor first and the shortcuts on the second tab', async () => {

@@ -73,6 +73,8 @@ export async function stopAllSidecars(): Promise<void> {
 export async function startReadySidecar(
   handler: ApiHandler,
   timing: { readonly apiTimeoutMs?: number } = {},
+  /** Registered before `start()`, like `onReady` in main. */
+  onReady?: (sidecar: Sidecar) => void,
 ): Promise<ReadySidecar> {
   const child = new FakeChild();
   const fetchMock = vi.fn<typeof fetch>((input, init) => {
@@ -100,6 +102,11 @@ export async function startReadySidecar(
     },
   });
   live.push(sidecar);
+  if (onReady !== undefined) {
+    sidecar.onReady(() => {
+      onReady(sidecar);
+    });
+  }
   sidecar.start();
   child.emitReady(PORT);
   await vi.waitFor(() => {

@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ClipDto, JobDto, PlaybackDto, PreviewDto, SourceDto } from '../shared/api';
+import type { ClipDto, JobDto, PlaybackDto, PreviewDto, SourceDto, TranscriptDetailDto } from '../shared/api';
 import { App } from './App';
 import {
   SOURCE_ID,
@@ -982,5 +982,159 @@ describe('Моменти: clips of the source', () => {
     expect(await screen.findByText('Мій фрагмент')).toBeVisible();
     expect(screen.queryByText('З другого джерела')).not.toBeInTheDocument();
     expect(call).toHaveBeenCalledWith('clips.list', { source_id: SOURCE_ID });
+  });
+});
+
+describe('Моменти: transcript of the source (ADR 039)', () => {
+  it('seeks the player to a segment when its time in the transcript is clicked', async () => {
+    const transcript: TranscriptDetailDto = {
+      id: '6d8f0a2c-3e5b-4c7d-8f9a-1b2c3d4e5f60',
+      source_id: SOURCE_ID,
+      revision: 1,
+      origin: 'stt',
+      run_id: null,
+      parent_id: null,
+      timing_level: 'segment',
+      language: 'uk',
+      duration_ms: 12_000,
+      word_count: 0,
+      segment_count: 1,
+      coverage: [{ start_ms: 0, end_ms: 12_000, state: 'succeeded' }],
+      created_at: '2026-11-16T10:00:00Z',
+      offset: 0,
+      limit: 1000,
+      next_offset: null,
+      segments: [
+        {
+          id: 'seg-1',
+          ordinal: 0,
+          start_ms: 4120,
+          end_ms: 6000,
+          text: 'Другий сегмент',
+          word_ids: [],
+          timing_level: 'segment',
+        },
+      ],
+      words: [],
+    };
+    await openMoments(makeSource(), {
+      'transcripts.list': () => ok({ items: [transcript], next_cursor: null }),
+      'transcripts.get': () => ok(transcript),
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: '00:00:04.120' }));
+    expect(screen.getByTestId('player-time')).toHaveTextContent('00:00:04.120 / 00:00:12.000');
+  });
+
+  it('runs no shortcut for a letter typed in a correction field, and runs the same letter outside one', async () => {
+    const { handlers } = clipBackend([makeClip()]);
+    const transcript: TranscriptDetailDto = {
+      id: '6d8f0a2c-3e5b-4c7d-8f9a-1b2c3d4e5f60',
+      source_id: SOURCE_ID,
+      revision: 1,
+      origin: 'stt',
+      run_id: null,
+      parent_id: null,
+      timing_level: 'segment',
+      language: 'uk',
+      duration_ms: 12_000,
+      word_count: 0,
+      segment_count: 1,
+      coverage: [{ start_ms: 0, end_ms: 12_000, state: 'succeeded' }],
+      created_at: '2026-11-16T10:00:00Z',
+      offset: 0,
+      limit: 1000,
+      next_offset: null,
+      segments: [
+        {
+          id: 'seg-1',
+          ordinal: 0,
+          start_ms: 4120,
+          end_ms: 6000,
+          text: 'Текст для виправлення',
+          word_ids: [],
+          timing_level: 'segment',
+        },
+      ],
+      words: [],
+    };
+    const { call } = await openMoments(makeSource(), {
+      ...handlers,
+      'transcripts.list': () => ok({ items: [transcript], next_cursor: null }),
+      'transcripts.get': () => ok(transcript),
+    });
+
+    // The clip is opened, so «A» would approve it; the transcript's «Виправити» opens the field.
+    fireEvent.click(await screen.findByTestId('open-clip'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Виправити' }));
+    const field = screen.getByRole('textbox', { name: 'Текст фрагмента' });
+
+    fireEvent.keyDown(field, { key: 'a', code: 'KeyA' });
+    fireEvent.keyDown(field, { key: 'r', code: 'KeyR' });
+    expect(paramsOf(call, 'clips.review')).toEqual([]);
+
+    // The same letter outside a text field is the shortcut: the clip is approved.
+    fireEvent.keyDown(document.body, { key: 'a', code: 'KeyA' });
+    await waitFor(() => {
+      expect(paramsOf(call, 'clips.review')).toHaveLength(1);
+    });
+  });
+
+  it('runs no shortcut for a letter typed after a failed save: the field has the focus again', async () => {
+    const { handlers } = clipBackend([makeClip()]);
+    const transcript: TranscriptDetailDto = {
+      id: '6d8f0a2c-3e5b-4c7d-8f9a-1b2c3d4e5f60',
+      source_id: SOURCE_ID,
+      revision: 1,
+      origin: 'stt',
+      run_id: null,
+      parent_id: null,
+      timing_level: 'segment',
+      language: 'uk',
+      duration_ms: 12_000,
+      word_count: 0,
+      segment_count: 1,
+      coverage: [{ start_ms: 0, end_ms: 12_000, state: 'succeeded' }],
+      created_at: '2026-11-16T10:00:00Z',
+      offset: 0,
+      limit: 1000,
+      next_offset: null,
+      segments: [
+        {
+          id: 'seg-1',
+          ordinal: 0,
+          start_ms: 4120,
+          end_ms: 6000,
+          text: 'Текст для виправлення',
+          word_ids: [],
+          timing_level: 'segment',
+        },
+      ],
+      words: [],
+    };
+    const { call } = await openMoments(makeSource(), {
+      ...handlers,
+      'transcripts.list': () => ok({ items: [transcript], next_cursor: null }),
+      'transcripts.get': () => ok(transcript),
+      'transcripts.correct': () => failure('INTERNAL_ERROR', 'Не вдалося зберегти. Спробуйте ще раз', true),
+    });
+
+    // The clip is opened, so «A» would approve it while the focus is outside a field.
+    fireEvent.click(await screen.findByTestId('open-clip'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Виправити' }));
+    const field = screen.getByRole('textbox', { name: 'Текст фрагмента' });
+    fireEvent.change(field, { target: { value: 'Інший текст' } });
+    // The focus is off the fields while the save is on its way (the save disables the clicked button).
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Зберегти' }));
+    expect(await screen.findByTestId('correction-error')).toHaveTextContent('Не вдалося зберегти');
+
+    // The key goes to the element that has the focus, as it does in the browser.
+    expect(field).toHaveFocus();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: 'a', code: 'KeyA' });
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: 'r', code: 'KeyR' });
+    expect(paramsOf(call, 'clips.review')).toEqual([]);
   });
 });

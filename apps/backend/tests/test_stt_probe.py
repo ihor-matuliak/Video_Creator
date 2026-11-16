@@ -5,9 +5,12 @@ Every case uses synthetic dicts or httpx2.MockTransport; nothing here touches th
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import importlib.util
 import json
 import sys
+import tempfile
 import wave
 from pathlib import Path
 from types import ModuleType
@@ -15,6 +18,10 @@ from typing import Any
 
 import httpx2
 import pytest
+
+from clipforge.adapters.media_tools import MediaTools
+
+from .support import fixture_file
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 FAKE_KEY = "sk-or-v1-test-key-0123456789abcdef"
@@ -235,7 +242,6 @@ def test_dry_run_prints_truncated_request_without_key(
     assert list(body) == [
         "model",
         "input_audio",
-        "language",
         "temperature",
         "response_format",
         "timestamp_granularities",
@@ -244,7 +250,8 @@ def test_dry_run_prints_truncated_request_without_key(
     assert body["input_audio"]["format"] == "wav"
     assert "base64 chars total" in body["input_audio"]["data"]
     assert len(body["input_audio"]["data"]) < 100
-    assert body["language"] == "en"
+    assert "language" not in body  # no language by default: the provider detects it
+    assert "provider" not in body
     assert body["temperature"] == 0
     assert body["response_format"] == "verbose_json"
     assert body["timestamp_granularities"] == ["segment", "word"]
@@ -576,3 +583,429 @@ def test_summary_write_failure_after_response_still_prints_summary(
     assert printed["save_error"]["type"] == "OSError"
     assert printed["generation_id"] == "gen-summary"
     _assert_no_key_on_disk(out_dir)
+
+
+# ------------------------------------------------------- language and MAI transcribe style
+
+GEMINI = "google/gemini-3.5-transcribe"
+ENV = {"OPENROUTER_API_KEY": FAKE_KEY}
+BODY_KEYS = ["model", "input_audio", "temperature", "response_format", "timestamp_granularities"]
+
+
+def _dry_run_body(argv: list[str], capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
+    code = probe.main([*argv, "--dry-run"], env={})
+    assert code == 0
+    printed: dict[str, Any] = json.loads(capsys.readouterr().out)
+    body: dict[str, Any] = printed["body"]
+    return body
+
+
+def test_language_is_sent_only_when_given(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wav = _write_wav(tmp_path / "s.wav", seconds=2)
+
+    default = _dry_run_body(["--audio", str(wav), "--model", MODEL], capsys)
+    spanish = _dry_run_body(["--audio", str(wav), "--model", MODEL, "--language", "es"], capsys)
+
+    assert list(default) == BODY_KEYS
+    assert list(spanish) == [*BODY_KEYS[:2], "language", *BODY_KEYS[2:]]
+    assert spanish["language"] == "es"
+    assert "provider" not in spanish
+
+
+def test_sent_request_has_no_language_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        return httpx2.Response(200, json={"text": "ok"})
+
+    code, out_dir, _ = _run_with_handler(tmp_path, handler, capsys)
+
+    assert code == 0
+    sent = json.loads(seen[0].content)
+    assert "language" not in sent
+    assert "provider" not in sent
+    (summary_path,) = out_dir.glob("*.summary.json")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["request"] == {"language": None, "mai_style": None, "window": None}
+    assert summary["audio"]["file"] == "s.wav"
+
+
+@pytest.mark.parametrize("language", ["", "eng", "EN", "e1", "uk-UA", " en"])
+def test_language_must_be_a_two_letter_iso_code(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], language: str
+) -> None:
+    wav = _write_wav(tmp_path / "s.wav", seconds=2)
+    calls: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(request)
+        return httpx2.Response(200, json={})
+
+    code = probe.main(
+        ["--audio", str(wav), "--model", MODEL, "--language", language],
+        env=ENV,
+        transport=httpx2.MockTransport(handler),
+    )
+
+    captured = capsys.readouterr()
+    assert code == probe.EXIT_REFUSED
+    assert calls == []
+    assert "--language" in captured.err
+    assert captured.out == ""
+
+
+def test_mai_style_is_forwarded_for_mai_models(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wav = _write_wav(tmp_path / "s.wav", seconds=2)
+    out_dir = tmp_path / "out"
+    seen: list[httpx2.Request] = []
+    expected_provider = {
+        "options": {
+            "azure": {"enhancedMode": {"modelOptions": {"transcribeStyle": "no-such-style"}}}
+        }
+    }
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        return httpx2.Response(200, json={"text": "ok"})
+
+    argv = ["--audio", str(wav), "--model", MODEL, "--mai-style", "no-such-style"]
+    dry = _dry_run_body(argv, capsys)
+    code = probe.main(
+        [*argv, "--language", "es", "--out-dir", str(out_dir)],
+        env=ENV,
+        transport=httpx2.MockTransport(handler),
+    )
+
+    capsys.readouterr()
+    assert dry["provider"] == expected_provider
+    assert "language" not in dry
+    assert code == 0
+    sent = json.loads(seen[0].content)
+    assert sent["provider"] == expected_provider
+    assert sent["language"] == "es"
+    (summary_path,) = out_dir.glob("*.summary.json")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["request"] == {"language": "es", "mai_style": "no-such-style", "window": None}
+
+
+@pytest.mark.parametrize("model", [GEMINI, "microsoft/phi-4"])
+def test_mai_style_is_refused_for_other_models(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], model: str
+) -> None:
+    wav = _write_wav(tmp_path / "s.wav", seconds=2)
+    out_dir = tmp_path / "out"
+    calls: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(request)
+        return httpx2.Response(200, json={})
+
+    code = probe.main(
+        ["--audio", str(wav), "--model", model, "--mai-style", "x", "--out-dir", str(out_dir)],
+        env=ENV,
+        transport=httpx2.MockTransport(handler),
+    )
+
+    captured = capsys.readouterr()
+    assert code == probe.EXIT_REFUSED
+    assert calls == []
+    assert not out_dir.exists()
+    assert "--mai-style" in captured.err
+    assert captured.out == ""
+    assert FAKE_KEY not in captured.err
+
+
+def test_gemini_request_without_mai_style_has_no_provider_options(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wav = _write_wav(tmp_path / "s.wav", seconds=2)
+
+    body = _dry_run_body(["--audio", str(wav), "--model", GEMINI, "--language", "en"], capsys)
+
+    assert "provider" not in body
+    assert body["language"] == "en"
+
+
+# -------------------------------------------------------- audio window of a video (--source)
+
+
+def _file_state(path: Path) -> tuple[str, int, int]:
+    stat = path.stat()
+    return hashlib.sha256(path.read_bytes()).hexdigest(), stat.st_size, stat.st_mtime_ns
+
+
+def _parse(*extra: str) -> Any:
+    return probe.build_parser().parse_args(["--model", MODEL, *extra])
+
+
+def test_source_window_is_cut_to_a_16k_mono_wav_of_the_requested_length(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    media_tools: MediaTools,
+) -> None:
+    source = fixture_file("color_gop.mp4")
+    before = _file_state(source)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    out_dir = tmp_path / "out"
+    seen: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        return httpx2.Response(200, json={"text": "ok"})
+
+    code = probe.main(
+        [
+            "--source",
+            str(source),
+            "--start-ms",
+            "2000",
+            "--duration-ms",
+            "3000",
+            "--model",
+            MODEL,
+            "--out-dir",
+            str(out_dir),
+        ],
+        env=ENV,
+        transport=httpx2.MockTransport(handler),
+        media_tools=media_tools,
+    )
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert len(seen) == 1
+    raw = base64.b64decode(json.loads(seen[0].content)["input_audio"]["data"])
+    wav_path = tmp_path / "sent.wav"
+    wav_path.write_bytes(raw)
+    with wave.open(str(wav_path), "rb") as reader:
+        assert reader.getframerate() == 16000
+        assert reader.getnchannels() == 1
+        assert reader.getsampwidth() == 2
+        assert reader.getnframes() == 3000 * 16
+    assert len(raw) == 44 + 2 * 3000 * 16
+    (summary_path,) = out_dir.glob("*.summary.json")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    window = summary["request"]["window"]
+    assert window.pop("seek_mode") in {"preseek", "full_decode"}
+    assert window == {
+        "source_file": "color_gop.mp4",
+        "start_ms": 2000,
+        "end_ms": 5000,
+        "duration_ms": 3000,
+        "audio_stream_index": 1,
+    }
+    assert summary["request"]["language"] is None
+    assert summary["request"]["mai_style"] is None
+    assert summary["audio"]["file"] is None
+    assert summary["audio"]["duration_s"] == 3.0
+    assert summary["audio"]["sample_rate"] == 16000
+    assert summary["audio"]["channels"] == 1
+    assert summary["audio"]["bytes"] == len(raw)
+    assert list(scratch.iterdir()) == []  # the temporary WAV is gone
+    assert _file_state(source) == before  # the video was only read
+    assert FAKE_KEY not in captured.out + captured.err
+
+
+def test_source_dry_run_needs_no_key_and_reports_the_window_audio_size(
+    capsys: pytest.CaptureFixture[str], media_tools: MediaTools
+) -> None:
+    source = fixture_file("color_gop.mp4")
+    before = _file_state(source)
+
+    code = probe.main(
+        [
+            "--source",
+            str(source),
+            "--start-ms",
+            "1000",
+            "--duration-ms",
+            "2500",
+            "--model",
+            MODEL,
+            "--language",
+            "es",
+            "--dry-run",
+        ],
+        env={},
+        media_tools=media_tools,
+    )
+
+    body = json.loads(capsys.readouterr().out)["body"]
+    wav_bytes = 44 + 2 * 2500 * 16
+    assert code == 0
+    assert body["language"] == "es"
+    assert f"<{-(-wav_bytes // 3) * 4} base64 chars total>" in body["input_audio"]["data"]
+    assert _file_state(source) == before
+
+
+@pytest.mark.parametrize(
+    ("name", "start_ms", "duration_ms"),
+    [
+        ("color_gop.mp4", 11000, 3000),  # runs past the end of the 12 s video
+        ("no_audio.mp4", 0, 1000),
+        ("does-not-exist.mp4", 0, 1000),
+    ],
+)
+def test_unusable_source_window_is_refused_before_any_request(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    media_tools: MediaTools,
+    name: str,
+    start_ms: int,
+    duration_ms: int,
+) -> None:
+    source = tmp_path / name if name == "does-not-exist.mp4" else fixture_file(name)
+    calls: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(request)
+        return httpx2.Response(200, json={})
+
+    code = probe.main(
+        [
+            "--source",
+            str(source),
+            "--start-ms",
+            str(start_ms),
+            "--duration-ms",
+            str(duration_ms),
+            "--model",
+            MODEL,
+            "--out-dir",
+            str(tmp_path / "out"),
+        ],
+        env=ENV,
+        transport=httpx2.MockTransport(handler),
+        media_tools=media_tools,
+    )
+
+    captured = capsys.readouterr()
+    assert code == probe.EXIT_REFUSED
+    assert calls == []
+    assert "refused:" in captured.err
+    assert captured.out == ""
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("duration", ["60001", "120000", "0", "-5"])
+def test_window_longer_than_60_seconds_is_refused_before_any_work(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], duration: str
+) -> None:
+    calls: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(request)
+        return httpx2.Response(200, json={})
+
+    code = probe.main(
+        [
+            "--source",
+            str(tmp_path / "never-opened.mp4"),
+            "--start-ms",
+            "0",
+            "--duration-ms",
+            duration,
+            "--model",
+            MODEL,
+            "--out-dir",
+            str(tmp_path / "out"),
+        ],
+        env=ENV,
+        transport=httpx2.MockTransport(handler),
+    )
+
+    captured = capsys.readouterr()
+    assert code == probe.EXIT_REFUSED
+    assert calls == []
+    assert captured.err.startswith("refused:")
+    assert "60000" in captured.err or "--duration-ms must be positive" in captured.err
+    assert not (tmp_path / "out").exists()
+
+
+def test_window_limit_is_60000_ms_inclusive() -> None:
+    source = ["--source", "video.mp4", "--start-ms", "5"]
+
+    probe.validate_options(_parse(*source, "--duration-ms", "60000"))
+    with pytest.raises(probe.ProbeRefusedError, match="60000"):
+        probe.validate_options(_parse(*source, "--duration-ms", "60001"))
+
+
+def test_audio_and_source_are_mutually_exclusive(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wav = _write_wav(tmp_path / "s.wav", seconds=2)
+
+    with pytest.raises(SystemExit) as raised:
+        probe.main(
+            [
+                "--audio",
+                str(wav),
+                "--source",
+                str(tmp_path / "v.mp4"),
+                "--start-ms",
+                "0",
+                "--duration-ms",
+                "1000",
+                "--model",
+                MODEL,
+                "--dry-run",
+            ],
+            env={},
+        )
+
+    assert raised.value.code == probe.EXIT_REFUSED
+    captured = capsys.readouterr()
+    assert "not allowed with argument" in captured.err
+    assert captured.out == ""
+
+
+def test_one_of_audio_and_source_is_required(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        probe.main(["--model", MODEL, "--dry-run"], env={})
+
+    assert raised.value.code == probe.EXIT_REFUSED
+    assert "required" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "window_args",
+    [[], ["--start-ms", "0"], ["--duration-ms", "1000"]],
+    ids=["neither", "only-start", "only-duration"],
+)
+def test_source_needs_both_start_and_duration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], window_args: list[str]
+) -> None:
+    code = probe.main(
+        ["--source", str(tmp_path / "v.mp4"), "--model", MODEL, *window_args, "--dry-run"],
+        env={},
+    )
+
+    captured = capsys.readouterr()
+    assert code == probe.EXIT_REFUSED
+    assert "--start-ms" in captured.err
+    assert captured.out == ""
+
+
+def test_window_options_are_refused_with_audio(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wav = _write_wav(tmp_path / "s.wav", seconds=2)
+
+    code = probe.main(
+        ["--audio", str(wav), "--model", MODEL, "--start-ms", "0", "--dry-run"], env={}
+    )
+
+    captured = capsys.readouterr()
+    assert code == probe.EXIT_REFUSED
+    assert "only with --source" in captured.err
+    assert captured.out == ""

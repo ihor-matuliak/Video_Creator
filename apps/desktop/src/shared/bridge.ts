@@ -5,8 +5,15 @@
  * added here as features need them.
  */
 
-import { API_DATA_PARSERS, isFolderToken, isUuid4, isVideoToken, parseSource } from './api';
-import type { ApiData, ApiOp, ApiParams, SourceDto } from './api';
+import {
+  API_DATA_PARSERS,
+  isFolderToken,
+  isUuid4,
+  isVideoToken,
+  parseSource,
+  parseTranscript,
+} from './api';
+import type { ApiData, ApiOp, ApiParams, SourceDto, TranscriptDto } from './api';
 
 /** IPC channel of the backend status query (ipcMain.handle in main). */
 export const APP_GET_STATUS_CHANNEL = 'app:get-status';
@@ -14,6 +21,8 @@ export const APP_GET_STATUS_CHANNEL = 'app:get-status';
 export const API_CALL_CHANNEL = 'api:call';
 /** Native video picker; main registers the picked file as a source itself. */
 export const IMPORT_VIDEO_CHANNEL = 'dialog:import-video';
+/** Native subtitle picker; main reads the .srt or .vtt file itself and posts it (ADR 039). */
+export const IMPORT_TRANSCRIPT_CHANNEL = 'dialog:import-transcript';
 /** Native video picker; main keeps the picked path behind a one-time token (ADR 024). */
 export const PICK_VIDEO_CHANNEL = 'dialog:pick-video';
 /** A file dropped on the window: the preload sends its path to main only (ADR 024). */
@@ -25,6 +34,13 @@ export const EXPORT_OPEN_FOLDER_CHANNEL = 'export:open-folder';
 /** The project and tab the app reopens at start; a small file in the app data folder. */
 export const VIEW_STATE_GET_CHANNEL = 'app:get-view-state';
 export const VIEW_STATE_SET_CHANNEL = 'app:set-view-state';
+/**
+ * The OpenRouter key lives in main (ADR 034). These three channels are its only way in and out of
+ * the renderer: the key goes in through `settings:set-api-key` once, and no channel returns it.
+ */
+export const API_KEY_SET_CHANNEL = 'settings:set-api-key';
+export const API_KEY_FORGET_CHANNEL = 'settings:forget-api-key';
+export const API_KEY_STATUS_CHANNEL = 'settings:get-api-key-status';
 
 export type AppState = 'starting' | 'ready' | 'failed';
 export type AppMode = 'production' | 'test';
@@ -65,6 +81,18 @@ export interface ImportVideoParams {
 }
 
 export type ImportVideoResult = { readonly canceled: true } | ApiResult<SourceDto>;
+
+/**
+ * `source_id` is the source the transcript belongs to; `offset_ms` shifts every time of the file
+ * (0 when absent). The file is chosen in a native dialog and is never named by the renderer.
+ */
+export interface ImportTranscriptParams {
+  readonly source_id: string;
+  readonly offset_ms?: number;
+}
+
+/** A cancelled dialog, or the new revision (ADR 039); never the path or the text of the file. */
+export type ImportTranscriptResult = { readonly canceled: true } | ApiResult<TranscriptDto>;
 
 /** A video picked or dropped by the user. `fileName` is the last path component only. */
 export interface VideoChoice {
@@ -141,12 +169,42 @@ export interface ViewStateSaved {
 
 export type SaveViewStateResult = ApiResult<ViewStateSaved>;
 
+/**
+ * How the key is kept: `protected` is encrypted with the operating system (safeStorage) in a file
+ * of the app data folder; `session` is in the memory of main only, because the system offers no
+ * protection, and is gone when the app closes; `none` is no key.
+ */
+export type ApiKeyState = 'protected' | 'session' | 'none';
+export const API_KEY_STATES: readonly ApiKeyState[] = ['protected', 'session', 'none'];
+
+/** `message` is a fixed Ukrainian text about a stored key that could not be read; else null. */
+export interface ApiKeyStatus {
+  readonly state: ApiKeyState;
+  readonly message: string | null;
+}
+
+/** 20-200 printable ASCII characters without a space: the rule of the backend (docs/04). */
+export const API_KEY_PATTERN = /^[\x21-\x7e]{20,200}$/;
+
+export function isApiKey(value: unknown): value is string {
+  return typeof value === 'string' && API_KEY_PATTERN.test(value);
+}
+
+/** Fixed text: it never carries the rejected value. */
+export const INVALID_API_KEY_MESSAGE =
+  'Ключ має містити від 20 до 200 друкованих символів ASCII без пробілів';
+
 /** `window.clipforge` as the preload exposes it (bridge v2). */
 export interface ClipforgeBridge {
   readonly bridgeVersion: 2;
   readonly getStatus: () => Promise<AppStatus>;
   readonly call: <O extends ApiOp>(op: O, params: ApiParams[O]) => Promise<ApiResult<ApiData[O]>>;
   readonly importVideo: (params: ImportVideoParams) => Promise<ImportVideoResult>;
+  /**
+   * Imports an .srt or .vtt file as a transcript of the source (ADR 039). Main shows the dialog,
+   * reads the file and posts it; the answer is the new revision, an error, or a cancel.
+   */
+  readonly importTranscript: (params: ImportTranscriptParams) => Promise<ImportTranscriptResult>;
   /** The native video picker; the path stays in main behind the returned one-time token. */
   readonly pickVideo: () => Promise<PickVideoResult>;
   /**
@@ -160,6 +218,14 @@ export interface ClipforgeBridge {
   readonly getViewState: () => Promise<ViewState | null>;
   /** Remembers the project and tab on screen; null forgets them (the project list is shown). */
   readonly setViewState: (state: ViewState | null) => Promise<SaveViewStateResult>;
+  /**
+   * Hands the OpenRouter key to main, which checks it, keeps it (encrypted when the system can)
+   * and gives it to the backend. The answer is the new status, never the key.
+   */
+  readonly setApiKey: (key: string) => Promise<ApiResult<ApiKeyStatus>>;
+  /** Forgets the key: the stored copy, the copy in main and the one in the backend. */
+  readonly forgetApiKey: () => Promise<ApiResult<ApiKeyStatus>>;
+  readonly getApiKeyStatus: () => Promise<ApiKeyStatus>;
 }
 
 function isAppState(value: unknown): value is AppState {
@@ -224,6 +290,19 @@ export function parseImportVideoResult(value: unknown): ImportVideoResult {
     return reply.canceled === true ? { canceled: true } : invalidReply(IMPORT_VIDEO_CHANNEL);
   }
   return parseApiResult(reply, parseSource, IMPORT_VIDEO_CHANNEL);
+}
+
+/**
+ * Validates the answer of `dialog:import-transcript`: a cancel or a `{ ok, data | error }` envelope
+ * whose data is a transcript revision. Any other key, a path or the text of the file included, is
+ * dropped.
+ */
+export function parseImportTranscriptResult(value: unknown): ImportTranscriptResult {
+  const reply = asRecord(value, IMPORT_TRANSCRIPT_CHANNEL);
+  if ('canceled' in reply) {
+    return reply.canceled === true ? { canceled: true } : invalidReply(IMPORT_TRANSCRIPT_CHANNEL);
+  }
+  return parseApiResult(reply, parseTranscript, IMPORT_TRANSCRIPT_CHANNEL);
 }
 
 /**
@@ -320,6 +399,26 @@ export function parseSaveViewStateResult(value: unknown): SaveViewStateResult {
         : invalidReply(VIEW_STATE_SET_CHANNEL),
     VIEW_STATE_SET_CHANNEL,
   );
+}
+
+const MAX_STATUS_MESSAGE_LENGTH = 500;
+
+/** `{ state, message }`; any other key is dropped, so nothing else can reach the renderer. */
+export function parseApiKeyStatus(value: unknown, channel = API_KEY_STATUS_CHANNEL): ApiKeyStatus {
+  const { state, message } = asRecord(value, channel);
+  const known = API_KEY_STATES.find((candidate) => candidate === state);
+  if (
+    known !== undefined &&
+    (message === null || (typeof message === 'string' && message.length <= MAX_STATUS_MESSAGE_LENGTH))
+  ) {
+    return { state: known, message };
+  }
+  return invalidReply(channel);
+}
+
+/** The answer of `settings:set-api-key` and `settings:forget-api-key`. */
+export function parseApiKeyResult(value: unknown, channel: string): ApiResult<ApiKeyStatus> {
+  return parseApiResult(value, (data) => parseApiKeyStatus(data, channel), channel);
 }
 
 export function parseOpenFolderResult(value: unknown): OpenFolderResult {

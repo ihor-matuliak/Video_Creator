@@ -21,3 +21,4 @@ outputs/
 coverage/
 .coverage
 *.pem
+.vitest/

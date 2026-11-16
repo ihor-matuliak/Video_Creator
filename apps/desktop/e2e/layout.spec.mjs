@@ -375,7 +375,7 @@ for (const { width, height } of SIZES) {
           // Tabs under the player: one splitter, and the panel starts below the player.
           await expect(page.getByRole('separator')).toHaveCount(1);
           const tabs = page.getByRole('tablist', { name: 'Вкладки панелі фрагмента' });
-          await expect(tabs.getByRole('tab')).toHaveText(['Межі', 'Клавіші']);
+          await expect(tabs.getByRole('tab')).toHaveText(['Межі', 'Клавіші', 'Транскрипція']);
           const playerBox = await page.getByRole('region', { name: 'Перегляд фрагмента' }).boundingBox();
           const detailsBox = await page.getByTestId('details-panel').boundingBox();
           expect(detailsBox.y).toBeGreaterThanOrEqual(playerBox.y + playerBox.height - 1);

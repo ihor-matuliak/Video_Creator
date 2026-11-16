@@ -39,7 +39,16 @@ addopts = "-ra --strict-markers --strict-config"
 testpaths = ["apps/backend/tests"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # FastAPI (fastapi/dependencies/utils.py analyze_param) sets `alias` on the FieldInfo of every
+    # Query/Header/Path/Cookie parameter, which makes pydantic >= 2.12 warn; ModelField.__post_init__
+    # silences it with warnings.catch_warnings(), which is not thread-safe. FastAPI builds each app's
+    # routes on its first request, so parallel first requests in tests (one app per thread) strip the
+    # silencing from each other and the warning becomes a 500. Only the `alias` message of this class
+    # is ignored: every other unused Field() attribute that pydantic reports still fails the tests.
+    "ignore:The 'alias' attribute with value:pydantic.warnings.UnsupportedFieldAttributeWarning",
+]
 xfail_strict = true
 
 [tool.coverage.run]

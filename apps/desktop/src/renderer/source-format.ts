@@ -1,9 +1,21 @@
-import type { PlaybackDto, VideoDto } from '../shared/api';
+import type { AudioStreamDto, PlaybackDto, VideoDto } from '../shared/api';
 import { PROXY_REASONS } from './player-logic';
 import type { Tone } from './ui';
 
 /** Shown for a fact the probe did not give. */
 export const NOT_KNOWN = 'невідомо';
+
+/** One audio track as the user reads it: its number, then whatever the file says about it. */
+export function describeTrack(stream: AudioStreamDto): string {
+  const parts = [
+    stream.language,
+    stream.title,
+    stream.channels === null ? null : `${String(stream.channels)} кан.`,
+    stream.codec === '' ? null : stream.codec.toUpperCase(),
+    stream.default ? 'за замовчуванням' : null,
+  ].filter((part): part is string => part !== null && part !== '');
+  return parts.length === 0 ? `Доріжка ${String(stream.index)}` : `Доріжка ${String(stream.index)} · ${parts.join(' · ')}`;
+}
 
 /** "1920×1080"; null unless both sides are known. */
 export function formatResolution(video: VideoDto): string | null {

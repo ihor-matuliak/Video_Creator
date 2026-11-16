@@ -36,14 +36,20 @@ class VersionedJson(TypeDecorator[Any]):
     def process_result_value(self, value: str | None, dialect: Dialect) -> Any | None:
         if value is None:
             return None
-        try:
-            document = json.loads(value)
-        except ValueError:
-            raise StorageError("Збережений JSON пошкоджений") from None
-        if (
-            not isinstance(document, dict)
-            or document.get("schema_version") != JSON_SCHEMA_VERSION
-            or "value" not in document
-        ):
-            raise StorageError("Збережений JSON має невідому версію схеми")
-        return document["value"]
+        return decode_versioned_json(value)
+
+
+def decode_versioned_json(text: str) -> Any:
+    """The value inside stored versioned JSON text. Raises ``StorageError`` (never echoing the
+    text) when it is not JSON or not a document of the known schema version."""
+    try:
+        document = json.loads(text)
+    except ValueError:
+        raise StorageError("Збережений JSON пошкоджений") from None
+    if (
+        not isinstance(document, dict)
+        or document.get("schema_version") != JSON_SCHEMA_VERSION
+        or "value" not in document
+    ):
+        raise StorageError("Збережений JSON має невідому версію схеми")
+    return document["value"]

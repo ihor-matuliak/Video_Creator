@@ -1,6 +1,8 @@
 import { randomBytes } from 'node:crypto';
-import { stat } from 'node:fs/promises';
+import { open, stat } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import { basename, extname, isAbsolute } from 'node:path';
+import { TextDecoder } from 'node:util';
 
 import type {
   BrowserWindow,
@@ -9,7 +11,13 @@ import type {
   OpenDialogReturnValue,
 } from 'electron';
 
-import { API_DATA_PARSERS, isApiOp, parseBackendExportBatch, parsePage } from '../shared/api';
+import {
+  API_DATA_PARSERS,
+  isApiOp,
+  parseBackendExportBatch,
+  parsePage,
+  parseTranscript,
+} from '../shared/api';
 import type { ApiData, ApiOp } from '../shared/api';
 import {
   API_CALL_CHANNEL,
@@ -17,6 +25,7 @@ import {
   DROP_VIDEO_CHANNEL,
   EXPORT_OPEN_FOLDER_CHANNEL,
   FILE_NOT_FOUND_MESSAGE,
+  IMPORT_TRANSCRIPT_CHANNEL,
   IMPORT_VIDEO_CHANNEL,
   PICK_VIDEO_CHANNEL,
   UNSUPPORTED_FILE_MESSAGE,
@@ -26,6 +35,8 @@ import type {
   ApiFailure,
   ApiResult,
   ChooseFolderResult,
+  ImportTranscriptParams,
+  ImportTranscriptResult,
   ImportVideoResult,
   OpenFolderResult,
   PickVideoResult,
@@ -36,6 +47,7 @@ import {
   parseCall,
   parseDropParams,
   parseImportParams,
+  parseImportTranscriptParams,
   parseOpenFolderParams,
 } from './api-ops';
 import type { ApiPlan } from './api-ops';
@@ -105,6 +117,19 @@ const FOLDER_DIALOG: OpenDialogOptions = {
   properties: ['openDirectory', 'createDirectory'],
 };
 
+/** The subtitle picker of `dialog:import-transcript` (ADR 039): the two formats the backend reads. */
+const TRANSCRIPT_DIALOG: OpenDialogOptions = {
+  title: 'Імпорт субтитрів',
+  properties: ['openFile'],
+  filters: [{ name: 'Субтитри', extensions: ['srt', 'vtt'] }],
+};
+
+const SUBTITLE_FORMATS = ['srt', 'vtt'] as const;
+/** The largest subtitle file that is read: 20 MB (ADR 039). */
+const SUBTITLE_MAX_BYTES = 20 * 1024 * 1024;
+/** The longest text the backend takes for an import, in code points (its MAX_IMPORT_TEXT_CHARS). */
+const MAX_IMPORT_TEXT_CHARS = 5_000_000;
+
 /**
  * What main accepts from the backend per op. Same as the parsers the preload
  * re-applies to main's answer, except for sources: the backend's own answer
@@ -147,6 +172,91 @@ function unknownFileToken(): ApiFailure {
 /** Whether the path names a file of a video type; the case of the extension does not matter. */
 function hasVideoExtension(path: string): boolean {
   return VIDEO_EXTENSIONS.includes(extname(path).slice(1).toLowerCase());
+}
+
+/** The format of a subtitle file by its extension, in any letter case; null for any other file. */
+function subtitleFormat(path: string): (typeof SUBTITLE_FORMATS)[number] | null {
+  const extension = extname(path).slice(1).toLowerCase();
+  return SUBTITLE_FORMATS.find((format) => format === extension) ?? null;
+}
+
+/** Whether a text has more than MAX_IMPORT_TEXT_CHARS code points; the UTF-16 length goes first. */
+function isOverImportLimit(text: string): boolean {
+  // A code point is one or two UTF-16 units: a text of no more units than the limit is within it,
+  // and one of more than twice the limit in units is over it. Only the texts in between are
+  // counted.
+  if (text.length <= MAX_IMPORT_TEXT_CHARS) {
+    return false;
+  }
+  return text.length > MAX_IMPORT_TEXT_CHARS * 2 || Array.from(text).length > MAX_IMPORT_TEXT_CHARS;
+}
+
+/** Reads from the start of an open file until `limit` bytes or the file ends, whichever is first. */
+async function readUpTo(handle: FileHandle, limit: number): Promise<Buffer> {
+  // Only the bytes that were read are returned, so the buffer need not be zeroed.
+  const buffer = Buffer.allocUnsafe(limit);
+  let filled = 0;
+  while (filled < limit) {
+    const { bytesRead } = await handle.read(buffer, filled, limit - filled, filled);
+    if (bytesRead === 0) {
+      break;
+    }
+    filled += bytesRead;
+  }
+  return buffer.subarray(0, filled);
+}
+
+/**
+ * Reads a subtitle file as strict UTF-8 without its byte order mark (ADR 039). `stat` decides the
+ * size before anything is read, so a file over 20 MB is refused unread. The read itself stops one
+ * byte past that limit, so a file that grew after `stat` is refused as well, and never read whole.
+ * Every failure is a fixed code and text: no path, no system message and no part of the file
+ * reaches the answer.
+ */
+async function readSubtitleText(path: string): Promise<string | ApiFailure> {
+  const unreadable = apiFailure('TRANSCRIPT_FILE_UNREADABLE', 'Не вдалося прочитати файл субтитрів');
+  const tooLarge = apiFailure('TRANSCRIPT_FILE_TOO_LARGE', 'Файл субтитрів більший за 20 МБ');
+  let size: number;
+  try {
+    const info = await stat(path);
+    if (!info.isFile()) {
+      return unreadable;
+    }
+    size = info.size;
+  } catch {
+    return unreadable;
+  }
+  if (size > SUBTITLE_MAX_BYTES) {
+    return tooLarge;
+  }
+  let handle: FileHandle;
+  try {
+    handle = await open(path, 'r');
+  } catch {
+    return unreadable;
+  }
+  let bytes: Buffer;
+  try {
+    bytes = await readUpTo(handle, SUBTITLE_MAX_BYTES + 1);
+  } catch {
+    return unreadable;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+  if (bytes.length > SUBTITLE_MAX_BYTES) {
+    return tooLarge;
+  }
+  let text: string;
+  try {
+    // `ignoreBOM` keeps the mark in the output, so the one removal below is the only one.
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    return apiFailure('TRANSCRIPT_FILE_ENCODING', 'Файл субтитрів не в кодуванні UTF-8');
+  }
+  const subtitles = text.startsWith('\uFEFF') ? text.slice(1) : text;
+  return isOverImportLimit(subtitles)
+    ? apiFailure('TRANSCRIPT_FILE_TOO_LARGE', 'Файл субтитрів містить понад 5 000 000 символів')
+    : subtitles;
 }
 
 /**
@@ -333,6 +443,44 @@ export class ApiGateway {
   }
 
   /**
+   * `dialog:import-transcript` with `{ source_id, offset_ms? }` (ADR 039). The params are checked
+   * before the dialog opens. Main shows the subtitle picker, takes the format from the extension,
+   * reads the file itself and posts its text to the backend with the source and the offset. The
+   * answer is a cancel, the new revision, or a failure (a file check here or the backend's error).
+   * The path never leaves main; the raw text goes only to the backend, whose parse error may quote
+   * a short fragment of it (ADR 039, доповнення).
+   */
+  async importTranscript(sender: IpcSender, payload: unknown): Promise<ImportTranscriptResult> {
+    this.#assertTrusted(sender);
+
+    let params: ImportTranscriptParams;
+    try {
+      params = parseImportTranscriptParams(payload);
+    } catch (error) {
+      return this.#paramFailure(error, invalidParams());
+    }
+    const path = await this.#pick(TRANSCRIPT_DIALOG);
+    if (path === null) {
+      return { canceled: true };
+    }
+    const format = subtitleFormat(path);
+    if (format === null) {
+      return apiFailure('TRANSCRIPT_FILE_UNSUPPORTED', 'Оберіть файл субтитрів у форматі SRT або VTT');
+    }
+    const subtitles = await readSubtitleText(path);
+    if (typeof subtitles !== 'string') {
+      return subtitles;
+    }
+    const result = await this.#options.backend.request('POST', '/v1/transcripts/import', {
+      source_id: params.source_id,
+      format,
+      text: subtitles,
+      offset_ms: params.offset_ms ?? 0,
+    });
+    return sanitize(result, parseTranscript);
+  }
+
+  /**
    * `dialog:pick-video`: the same dialog as `dialog:import-video`; the picked file stays here
    * and the renderer gets a one-time token with the file name (ADR 024).
    */
@@ -500,11 +648,14 @@ export function toIpcSender(event: IpcMainInvokeEvent): IpcSender {
   };
 }
 
-/** Registers the six gateway channels; each handler checks its sender first. */
+/** Registers the seven gateway channels; each handler checks its sender first. */
 export function registerApiIpc(ipc: IpcRegistry, gateway: ApiGateway): void {
   ipc.handle(API_CALL_CHANNEL, (event, payload) => gateway.call(toIpcSender(event), payload));
   ipc.handle(IMPORT_VIDEO_CHANNEL, (event, payload) =>
     gateway.importVideo(toIpcSender(event), payload),
+  );
+  ipc.handle(IMPORT_TRANSCRIPT_CHANNEL, (event, payload) =>
+    gateway.importTranscript(toIpcSender(event), payload),
   );
   ipc.handle(PICK_VIDEO_CHANNEL, (event) => gateway.pickVideo(toIpcSender(event)));
   ipc.handle(DROP_VIDEO_CHANNEL, (event, payload) =>

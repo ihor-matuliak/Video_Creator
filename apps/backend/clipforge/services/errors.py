@@ -19,6 +19,9 @@ class ErrorKind(StrEnum):
     CONFLICT = "conflict"
     INVALID = "invalid"
     UNAVAILABLE = "unavailable"
+    # A limit of this app, not of a remote service: the spending ceiling of a run (docs/04
+    # section 4: 429, a local rate/budget condition with its own domain code).
+    LIMIT_EXCEEDED = "limit_exceeded"
 
 
 class ServiceError(Exception):

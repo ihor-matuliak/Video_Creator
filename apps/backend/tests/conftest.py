@@ -11,9 +11,12 @@ from fastapi.testclient import TestClient
 from clipforge.adapters.media_tools import MediaTools, resolve_media_tools
 from clipforge.api.app import create_app
 from clipforge.config import Mode
+from clipforge.services.credentials import KeyChecker
 from clipforge.services.runtime import Runtime
+from clipforge.services.transcription_jobs import SttClientFactory
+from clipforge.services.transcription_runs import AudioExtractor
 
-from .support import BASE_URL, PORT, TOKEN, RuntimeFactory, make_config
+from .support import BASE_URL, PORT, TOKEN, FakeProvider, RuntimeFactory, make_config
 
 
 @pytest.fixture(scope="session")
@@ -27,15 +30,27 @@ def make_runtime(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Run
     """``factory(with_tools=True, data_dir=None)``: an open runtime, closed at teardown.
 
     Every call gets its own workspace unless ``data_dir`` is given, because a workspace can be
-    open only once. ``with_tools=False`` simulates a machine without FFmpeg.
+    open only once. ``with_tools=False`` simulates a machine without FFmpeg. ``stt_client_factory``
+    and ``extract_audio`` replace the provider and the FFmpeg audio extraction (no network, no
+    cost). ``key_checker`` says how the API key is checked: tests point it at ``fake_provider``.
     """
     opened: list[Runtime] = []
 
-    def factory(*, with_tools: bool = True, data_dir: Path | None = None) -> Runtime:
+    def factory(
+        *,
+        with_tools: bool = True,
+        data_dir: Path | None = None,
+        stt_client_factory: SttClientFactory | None = None,
+        extract_audio: AudioExtractor | None = None,
+        key_checker: KeyChecker | None = None,
+    ) -> Runtime:
         tools: MediaTools | None = request.getfixturevalue("media_tools") if with_tools else None
         runtime = Runtime.start(
             data_dir if data_dir is not None else tmp_path / f"workspace-{len(opened)}",
             media_tools=tools,
+            stt_client_factory=stt_client_factory,
+            extract_audio=extract_audio,
+            key_checker=key_checker,
         )
         opened.append(runtime)
         return runtime
@@ -45,6 +60,16 @@ def make_runtime(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Run
     finally:
         for runtime in reversed(opened):
             runtime.close()
+
+
+@pytest.fixture
+def fake_provider() -> Iterator[FakeProvider]:
+    """A loopback HTTP server that stands in for OpenRouter and records every request."""
+    provider = FakeProvider()
+    try:
+        yield provider
+    finally:
+        provider.close()
 
 
 @pytest.fixture

@@ -5,6 +5,17 @@ real response contract under test-results/live/. This is a paid call: it makes a
 single attempt and never retries. A timeout after the request was sent is reported
 as ``unknown_outcome`` because the provider may still have processed (and billed) it.
 
+The audio is either a ready WAV (``--audio``) or a window of a video
+(``--source VIDEO --start-ms N --duration-ms N``, at most 60000 ms). The window is cut with
+``clipforge.adapters.stt_audio.extract_stt_audio`` (PCM WAV, mono, 16 kHz) into a temporary
+directory that is removed before the request is sent; the video is only read.
+
+``--language`` is not sent by default (the provider detects the language); give an ISO-639-1
+code such as ``en`` or ``es`` to send it. ``--mai-style VALUE`` (only for ``microsoft/mai-*``)
+adds ``provider.options.azure.enhancedMode.modelOptions.transcribeStyle=VALUE``; any string is
+accepted, so a deliberately wrong value can prove that the option is forwarded. Language, style
+and the window are recorded in the summary JSON under ``request``.
+
 The API key is read only from the OPENROUTER_API_KEY environment variable. It is
 never accepted on the command line and never printed or written to disk.
 
@@ -30,6 +41,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+import uuid
 import wave
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -39,11 +51,23 @@ from typing import Any
 
 import httpx2
 
+from clipforge.adapters.ffprobe import ProbeError, probe_source
+from clipforge.adapters.media_tools import (
+    MediaTools,
+    MediaToolsUnavailableError,
+    resolve_media_tools,
+)
+from clipforge.adapters.stt_audio import SttAudioRequest, extract_stt_audio
+from clipforge.domain.interval import IntervalError
+from clipforge.services.export_engine import ExportError
+
 ENDPOINT = "https://openrouter.ai/api/v1/audio/transcriptions"
 API_KEY_ENV = "OPENROUTER_API_KEY"
 TIMEOUT_S = 90.0
 MAX_AUDIO_SECONDS = 60.0
 MAX_AUDIO_BYTES = 20 * 1024 * 1024
+MAX_WINDOW_MS = 60_000
+MAI_MODEL_PREFIX = "microsoft/mai-"
 ERROR_MESSAGE_LIMIT = 500
 BASE64_PREVIEW_CHARS = 24
 
@@ -60,6 +84,7 @@ EXIT_SAVE_FAILED = 5
 
 _TOKEN_RE = re.compile(r"\d+(?:[.:]\d+)*|[^\W\d_]+(?:'[^\W\d_]+)*")
 _THOUSANDS_RE = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
+_LANGUAGE_RE = re.compile(r"[a-z]{2}")
 
 
 class ProbeRefusedError(Exception):
@@ -75,6 +100,17 @@ class AudioInfo:
     channels: int
     sha256: str
     data: bytes
+
+
+@dataclass(frozen=True)
+class SourceWindow:
+    """The part of a video that was cut into the probe audio (canonical source milliseconds)."""
+
+    source: Path
+    start_ms: int
+    end_ms: int
+    audio_stream_index: int
+    seek_mode: str
 
 
 # --------------------------------------------------------------------------- audio
@@ -118,18 +154,127 @@ def inspect_audio(path: Path) -> AudioInfo:
     )
 
 
+def extract_source_window(
+    source: Path,
+    start_ms: int,
+    duration_ms: int,
+    media_tools: MediaTools | None,
+    environment: Mapping[str, str],
+) -> tuple[AudioInfo, SourceWindow]:
+    """Cut ``[start_ms, start_ms + duration_ms)`` of the first audio stream into a temporary WAV.
+
+    The video is only read. The WAV (PCM, mono, 16 kHz) lives in a temporary directory that is
+    removed before this function returns; the probe keeps its bytes in the returned AudioInfo.
+    """
+    try:
+        tools = (
+            media_tools
+            if media_tools is not None
+            else resolve_media_tools("production", environment)
+        )
+        absolute = source.absolute()
+        audio_streams = probe_source(tools.ffprobe, absolute).audio_streams
+        if not audio_streams:
+            raise ProbeRefusedError("the source has no audio stream")
+        stream_index = audio_streams[0].index
+        with tempfile.TemporaryDirectory(
+            prefix="stt-probe-", ignore_cleanup_errors=True
+        ) as scratch:
+            result = extract_stt_audio(
+                tools,
+                SttAudioRequest(
+                    task_id=str(uuid.uuid4()),
+                    source=absolute,
+                    output_dir=Path(scratch),
+                    audio_stream_index=stream_index,
+                    upload_start_ms=start_ms,
+                    upload_end_ms=start_ms + duration_ms,
+                ),
+            )
+            audio = inspect_audio(result.path)
+    except (ProbeError, ExportError, IntervalError, MediaToolsUnavailableError) as exc:
+        raise ProbeRefusedError(
+            f"cannot cut the audio window from the source: {exc.message} ({exc.code})"
+        ) from exc
+    except OSError as exc:
+        raise ProbeRefusedError(
+            f"cannot cut the audio window from the source: {exc.strerror or exc}"
+        ) from exc
+    window = SourceWindow(
+        source=source,
+        start_ms=result.upload_start_ms,
+        end_ms=result.upload_end_ms,
+        audio_stream_index=stream_index,
+        seek_mode=result.seek_mode,
+    )
+    return audio, window
+
+
+def validate_options(args: argparse.Namespace) -> None:
+    """Refuse bad option combinations before any audio work or request."""
+    if args.language is not None and not _LANGUAGE_RE.fullmatch(args.language):
+        raise ProbeRefusedError(
+            "--language must be a two-letter lowercase ISO-639-1 code such as en or es"
+        )
+    if args.mai_style is not None and not args.model.startswith(MAI_MODEL_PREFIX):
+        raise ProbeRefusedError(
+            f"--mai-style applies only to {MAI_MODEL_PREFIX}* models; "
+            f"{args.model} would not receive it"
+        )
+    if args.source is None:
+        if args.start_ms is not None or args.duration_ms is not None:
+            raise ProbeRefusedError("--start-ms and --duration-ms are used only with --source")
+        return
+    if args.start_ms is None or args.duration_ms is None:
+        raise ProbeRefusedError("--source needs both --start-ms and --duration-ms")
+    if args.start_ms < 0:
+        raise ProbeRefusedError("--start-ms must not be negative")
+    if args.duration_ms <= 0:
+        raise ProbeRefusedError("--duration-ms must be positive")
+    if args.duration_ms > MAX_WINDOW_MS:
+        raise ProbeRefusedError(
+            f"the window is {args.duration_ms} ms; the probe limit is {MAX_WINDOW_MS} ms"
+        )
+
+
+def window_summary(window: SourceWindow | None) -> dict[str, Any] | None:
+    if window is None:
+        return None
+    return {
+        "source_file": window.source.name,
+        "start_ms": window.start_ms,
+        "end_ms": window.end_ms,
+        "duration_ms": window.end_ms - window.start_ms,
+        "audio_stream_index": window.audio_stream_index,
+        "seek_mode": window.seek_mode,
+    }
+
+
 # ------------------------------------------------------------------------- request
 
 
-def build_request_body(model: str, audio_b64: str) -> dict[str, Any]:
-    return {
+def build_request_body(
+    model: str,
+    audio_b64: str,
+    *,
+    language: str | None = None,
+    mai_style: str | None = None,
+) -> dict[str, Any]:
+    """The request body. ``language`` and ``mai_style`` are added only when given."""
+    body: dict[str, Any] = {
         "model": model,
         "input_audio": {"data": audio_b64, "format": "wav"},
-        "language": "en",
-        "temperature": 0,
-        "response_format": "verbose_json",
-        "timestamp_granularities": ["segment", "word"],
     }
+    if language is not None:
+        body["language"] = language
+    body["temperature"] = 0
+    body["response_format"] = "verbose_json"
+    body["timestamp_granularities"] = ["segment", "word"]
+    if mai_style is not None:
+        body["provider"] = {
+            "options": {"azure": {"enhancedMode": {"modelOptions": {"transcribeStyle": mai_style}}}}
+        }
+    return body
 
 
 def describe_request(body: Mapping[str, Any]) -> dict[str, Any]:
@@ -343,8 +488,32 @@ def build_parser() -> argparse.ArgumentParser:
             f"The key is read from {API_KEY_ENV} only."
         ),
     )
-    parser.add_argument("--audio", type=Path, required=True, help="PCM WAV, <= 60 s and <= 20 MiB")
+    audio_source = parser.add_mutually_exclusive_group(required=True)
+    audio_source.add_argument("--audio", type=Path, help="PCM WAV, <= 60 s and <= 20 MiB")
+    audio_source.add_argument(
+        "--source",
+        type=Path,
+        help="video to cut the audio from (read only); needs --start-ms and --duration-ms",
+    )
+    parser.add_argument("--start-ms", type=int, help="window start in the video, milliseconds")
+    parser.add_argument(
+        "--duration-ms",
+        type=int,
+        help=f"window length in milliseconds, 1..{MAX_WINDOW_MS}",
+    )
     parser.add_argument("--model", required=True, help="OpenRouter model id")
+    parser.add_argument(
+        "--language",
+        help="ISO-639-1 code such as en or es; when omitted the field is not sent (auto-detect)",
+    )
+    parser.add_argument(
+        "--mai-style",
+        metavar="VALUE",
+        help=(
+            "microsoft/mai-* only: sends provider.options.azure.enhancedMode.modelOptions."
+            "transcribeStyle=VALUE (any string)"
+        ),
+    )
     parser.add_argument(
         "--script", type=Path, default=DEFAULT_SCRIPT, help="reference text for the WER"
     )
@@ -366,7 +535,9 @@ def _send_once(
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     started = time.perf_counter()
     try:
-        with httpx2.Client(timeout=httpx2.Timeout(TIMEOUT_S), transport=transport) as client:
+        with httpx2.Client(
+            timeout=httpx2.Timeout(TIMEOUT_S), transport=transport, trust_env=False
+        ) as client:
             response = client.post(ENDPOINT, headers=headers, json=body)
     except (httpx2.ConnectTimeout, httpx2.ConnectError, httpx2.PoolTimeout) as exc:
         return "not_sent", None, time.perf_counter() - started, exc
@@ -382,22 +553,38 @@ def main(
     *,
     env: Mapping[str, str] | None = None,
     transport: httpx2.BaseTransport | None = None,
+    media_tools: MediaTools | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
     environment = os.environ if env is None else env
 
     try:
-        audio = inspect_audio(args.audio)
-        reference_text = args.script.read_text(encoding="utf-8")
+        validate_options(args)
     except ProbeRefusedError as exc:
         _eprint(f"refused: {exc}")
         return EXIT_REFUSED
+    try:
+        reference_text = args.script.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         _eprint(f"refused: cannot read script text: {exc}")
         return EXIT_REFUSED
 
+    window: SourceWindow | None = None
+    try:
+        if args.source is not None:
+            audio, window = extract_source_window(
+                args.source, args.start_ms, args.duration_ms, media_tools, environment
+            )
+        else:
+            audio = inspect_audio(args.audio)
+    except ProbeRefusedError as exc:
+        _eprint(f"refused: {exc}")
+        return EXIT_REFUSED
+
     audio_b64 = base64.b64encode(audio.data).decode("ascii")
-    body = build_request_body(args.model, audio_b64)
+    body = build_request_body(
+        args.model, audio_b64, language=args.language, mai_style=args.mai_style
+    )
 
     if args.dry_run:
         print(json.dumps(describe_request(body), indent=2))
@@ -423,8 +610,13 @@ def main(
         "model": args.model,
         "started_utc": started_at.isoformat(timespec="seconds"),
         "endpoint": ENDPOINT,
+        "request": {
+            "language": args.language,
+            "mai_style": args.mai_style,
+            "window": window_summary(window),
+        },
         "audio": {
-            "file": audio.path.name,
+            "file": audio.path.name if window is None else None,
             "bytes": audio.size_bytes,
             "duration_s": round(audio.duration_s, 3),
             "sample_rate": audio.sample_rate,
