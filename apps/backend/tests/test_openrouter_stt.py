@@ -363,11 +363,11 @@ def test_mai_fixture_has_no_zero_length_word_so_the_gemini_one_is_real() -> None
         (422, "invalid_request"),
         (418, "invalid_request"),
         (451, "invalid_request"),
-        (408, "upstream"),
+        (408, "unknown_outcome"),
         (500, "upstream"),
         (502, "upstream"),
         (503, "upstream"),
-        (504, "upstream"),
+        (504, "unknown_outcome"),
         (599, "upstream"),
     ],
 )
@@ -380,6 +380,16 @@ def test_http_status_maps_to_one_error_kind_after_one_attempt(
     assert error.status == status
     assert error.retry_after_s is None
     assert error.generation_id is None
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("status", [408, 504])
+def test_a_timeout_answer_is_unknown_outcome_and_the_audio_is_never_sent_again(status: int) -> None:
+    # The provider may have processed and billed the audio (ADR 041 §22): one POST, no retry.
+    error, seen = failure(reply(httpx2.Response(status, json={"error": {"message": "x"}})))
+
+    assert (error.kind, error.status, error.retry_after_s) == ("unknown_outcome", status, None)
+    assert "повтору немає" in str(error)
     assert len(seen) == 1
 
 

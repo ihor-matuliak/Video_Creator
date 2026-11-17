@@ -25,6 +25,7 @@ BACKEND_DIR = PACKAGING_DIR.parent
 REPO_ROOT = BACKEND_DIR.parents[1]
 ENTRY = PACKAGING_DIR / "sidecar_entry.py"
 MIGRATIONS_DIR = BACKEND_DIR / "clipforge" / "storage" / "migrations"
+RESOURCES_DIR = BACKEND_DIR / "clipforge" / "resources"
 DIST_DIR = REPO_ROOT / "build" / "sidecar"
 WORK_DIR = REPO_ROOT / "build" / "sidecar-work"
 EXE = DIST_DIR / NAME / f"{NAME}.exe"
@@ -36,18 +37,20 @@ HIDDEN_IMPORTS = (
     "alembic.op",  # revision scripts
     "alembic.ddl.sqlite",  # dialect implementation looked up by dialect name
     "sqlalchemy.dialects.sqlite.pysqlite",  # driver loaded by name from "sqlite+pysqlite"
+    "clipforge.resources",  # package read only through importlib.resources.files(...)
 )
 
 
-def migration_data_args() -> list[str]:
-    """``--add-data`` for every migration file, placed where the source tree has it.
+def data_args(directory: Path) -> list[str]:
+    """``--add-data`` for every file under ``directory``, placed where the source tree has it.
 
-    ``migrate.py`` resolves the scripts from its own ``__file__`` and Alembic loads them from
-    files, so the migrations are data, not modules. ``__pycache__`` is not shipped.
+    Migrations are data: ``migrate.py`` resolves the scripts from its own ``__file__`` and Alembic
+    loads them from files. The prompt resources are data read through ``importlib.resources``.
+    ``__pycache__`` is not shipped.
     """
     args: list[str] = []
-    for path in sorted(MIGRATIONS_DIR.rglob("*")):
-        if not path.is_file() or "__pycache__" in path.relative_to(MIGRATIONS_DIR).parts:
+    for path in sorted(directory.rglob("*")):
+        if not path.is_file() or "__pycache__" in path.relative_to(directory).parts:
             continue
         destination = path.parent.relative_to(BACKEND_DIR).as_posix()
         args += ["--add-data", f"{path}{os.pathsep}{destination}"]
@@ -84,7 +87,8 @@ def main() -> int:
         str(WORK_DIR),
         "--paths",
         str(BACKEND_DIR),
-        *migration_data_args(),
+        *data_args(MIGRATIONS_DIR),
+        *data_args(RESOURCES_DIR),
         *hidden_import_args(),
         "--log-level",
         "WARN",

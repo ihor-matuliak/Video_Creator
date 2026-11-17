@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, renderHook, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import type {
@@ -24,6 +24,7 @@ import {
   ok,
 } from './test-bridge';
 import type { ApiHandlers, InstalledBridge } from './test-bridge';
+import { useTranscriptChanged } from './transcript-events';
 import { ViewActiveContext } from './view-active';
 
 // ADR 038: the «Розпізнавання мовлення» block of the source inspector. The backend is a small fake
@@ -1954,4 +1955,47 @@ describe('where the focus goes after a question or a cancel (L9)', () => {
     });
     expect(screen.queryByTestId('transcription-confirm-text')).not.toBeInTheDocument();
   });
+});
+
+describe('the transcript changes when a recognition job closes (ADR 041 §23(10))', () => {
+  it.each([
+    ['succeeded', runOf('completed', chunksOf('succeeded'), { revision_id: 'r1' })],
+    ['failed', runOf('partial', chunksOf('succeeded', 'failed'))],
+  ])(
+    'tells the listeners of the source once, when the job closes as %s',
+    async (jobState, closedRun) => {
+      const heard = vi.fn();
+      renderHook(() => {
+        useTranscriptChanged(SOURCE_ID, heard);
+      });
+      const { installed, state } = show({
+        backend: { runs: [runOf('running', chunksOf('running'))], jobs: { [JOB_ID]: jobOf('running') } },
+      });
+      await screen.findByTestId('transcription-progress');
+
+      // The run is written as over while its job is still open: the job is what counts.
+      state.runs = [closedRun];
+      const reads = paramsOf(installed, 'transcription.get').length;
+      await waitFor(
+        () => {
+          expect(paramsOf(installed, 'transcription.get').length).toBeGreaterThan(reads + 1);
+        },
+        { timeout: 4000 },
+      );
+      expect(heard).not.toHaveBeenCalled();
+
+      state.jobs[JOB_ID] = jobOf(jobState);
+      await waitFor(
+        () => {
+          expect(heard).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 4000 },
+      );
+
+      // The read after the close, and the polls that are no more, announce nothing else.
+      await pass(1500);
+      expect(heard).toHaveBeenCalledTimes(1);
+    },
+    15_000,
+  );
 });

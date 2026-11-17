@@ -24,6 +24,7 @@ from sqlalchemy import (
     delete,
     func,
     insert,
+    literal_column,
     or_,
     select,
     text,
@@ -39,6 +40,9 @@ from .models import (
     SPEND_COUNTS_ACTUAL,
     SPEND_COUNTS_NOTHING,
     SPEND_COUNTS_RESERVED,
+    AnalysisAttempt,
+    AnalysisRun,
+    AnalysisWindow,
     AppSetting,
     Clip,
     ExportBatch,
@@ -79,6 +83,22 @@ CHUNK_MUTABLE_FIELDS: Final = frozenset(
         "error_code",
         "reserved_micro_usd",
         "actual_micro_usd",
+    }
+)
+
+ANALYSIS_RUN_MUTABLE_FIELDS: Final = frozenset({"status", "error_code", "diagnostics_json"})
+ANALYSIS_WINDOW_MUTABLE_FIELDS: Final = frozenset(
+    {"state", "attempts", "repair_used", "error_code", "result_json"}
+)
+ANALYSIS_ATTEMPT_MUTABLE_FIELDS: Final = frozenset(
+    {
+        "state",
+        "request_id",
+        "spend_entry_id",
+        "http_status",
+        "error_code",
+        "raw_output",
+        "usage_json",
     }
 )
 
@@ -403,10 +423,13 @@ class ClipRepository:
         visual_review_required: bool = False,
         recommended_start_ms: int | None = None,
         recommended_end_ms: int | None = None,
+        evidence_start_ms: int | None = None,
+        evidence_end_ms: int | None = None,
         analysis_run_id: str | None = None,
         review_status: str = "suggested",
     ) -> Clip:
-        """New clip at revision 1 with export_state "none"."""
+        """New clip at revision 1 with export_state "none". The evidence interval is NULL or a
+        valid ``[start, end)`` (a DB CHECK); ``analysis_run_id`` names an existing run (a FK)."""
         now = self._now()
         clip = Clip(
             id=new_id(),
@@ -418,6 +441,8 @@ class ClipRepository:
             end_ms=end_ms,
             recommended_start_ms=recommended_start_ms,
             recommended_end_ms=recommended_end_ms,
+            evidence_start_ms=evidence_start_ms,
+            evidence_end_ms=evidence_end_ms,
             categories=list(categories),
             evidence_type=evidence_type,
             evidence_ids=list(evidence_ids),
@@ -504,6 +529,41 @@ class ClipRepository:
         if _rowcount(self._session.execute(statement)) == 0:
             raise RecordNotFound("clip", clip_id)
         return self._reload(clip_id)
+
+    def analysis_stale_ids(self, clips: Sequence[Clip]) -> frozenset[str]:
+        """Ids of the clips whose analysis run read a transcript revision that is not the newest
+        revision of its source (ADR 041 §11). Derived, never stored: a correction adds a revision
+        and rewrites no clip. Two queries whatever the number of clips, none without a run."""
+        run_ids = tuple(
+            {clip.analysis_run_id for clip in clips if clip.analysis_run_id is not None}
+        )
+        if not run_ids:
+            return frozenset()
+        source_ids = tuple({clip.source_id for clip in clips if clip.analysis_run_id is not None})
+        # Both lookups are present for every clip with a run: the foreign key names an existing
+        # run, and a run exists only for a transcript that has a revision.
+        read = {
+            run_id: revision
+            for run_id, revision in self._session.execute(
+                select(AnalysisRun.id, AnalysisRun.transcript_revision).where(
+                    AnalysisRun.id.in_(run_ids)
+                )
+            )
+        }
+        newest = {
+            source_id: revision
+            for source_id, revision in self._session.execute(
+                select(TranscriptRevision.source_id, func.max(TranscriptRevision.revision))
+                .where(TranscriptRevision.source_id.in_(source_ids))
+                .group_by(TranscriptRevision.source_id)
+            )
+        }
+        return frozenset(
+            clip.id
+            for clip in clips
+            if clip.analysis_run_id is not None
+            and read.get(clip.analysis_run_id) != newest.get(clip.source_id)
+        )
 
     def _reload(self, clip_id: str) -> Clip:
         statement = select(Clip).where(Clip.id == clip_id).execution_options(populate_existing=True)
@@ -1122,6 +1182,195 @@ class TranscriptRunRepository:
             select(TranscriptChunk)
             .where(TranscriptChunk.run_id == run_id)
             .order_by(TranscriptChunk.core_start_ms, TranscriptChunk.id)
+        )
+        return list(self._session.scalars(statement))
+
+
+class AnalysisRunRepository:
+    """Analysis runs with their windows and attempts (ADR 041 §8). Which states they go through is
+    the business of the analysis service (ADR 041 §9); this class stores what it is given, and the
+    database refuses values outside the vocabularies of ``models``."""
+
+    def __init__(self, session: Session, *, now: Clock = utc_now) -> None:
+        self._session = session
+        self._now = now
+
+    def add_run(
+        self,
+        *,
+        source_id: str,
+        transcript_id: str,
+        transcript_revision: int,
+        profile_json: Mapping[str, Any],
+        model: str,
+        provider: str,
+        prompt_version: str,
+        schema_version: int,
+        unit_level: str,
+        price_snapshot_json: Mapping[str, Any],
+        status: str,
+        diagnostics_json: Mapping[str, Any] | None = None,
+    ) -> AnalysisRun:
+        now = self._now()
+        run = AnalysisRun(
+            id=new_id(),
+            source_id=source_id,
+            transcript_id=transcript_id,
+            transcript_revision=transcript_revision,
+            profile_json=dict(profile_json),
+            model=model,
+            provider=provider,
+            prompt_version=prompt_version,
+            schema_version=schema_version,
+            unit_level=unit_level,
+            price_snapshot_json=dict(price_snapshot_json),
+            status=status,
+            error_code=None,
+            diagnostics_json=dict(diagnostics_json) if diagnostics_json is not None else None,
+            created_at=now,
+            updated_at=now,
+        )
+        self._session.add(run)
+        self._session.flush()
+        return run
+
+    def get_run(self, run_id: str) -> AnalysisRun | None:
+        return self._session.get(AnalysisRun, run_id)
+
+    def list_runs_for_source(self, source_id: str) -> list[AnalysisRun]:
+        """Every run of the source, the newest first: by ``created_at`` (fixed-width UTC text, so
+        text order is time order), ties by id."""
+        statement = (
+            select(AnalysisRun)
+            .where(AnalysisRun.source_id == source_id)
+            .order_by(AnalysisRun.created_at.desc(), AnalysisRun.id.desc())
+        )
+        return list(self._session.scalars(statement))
+
+    def update_run(self, run_id: str, **changes: Any) -> AnalysisRun:
+        """Only ``ANALYSIS_RUN_MUTABLE_FIELDS``; the source, transcript, model and prices are fixed.
+        ``updated_at`` is set from this repository's clock."""
+        unknown = sorted(set(changes) - ANALYSIS_RUN_MUTABLE_FIELDS)
+        if unknown:
+            raise ValueError(f"Непідтримувані поля запуску аналізу: {', '.join(unknown)}")
+        run = self._session.get(AnalysisRun, run_id)
+        if run is None:
+            raise RecordNotFound("analysis_run", run_id)
+        for name, value in changes.items():
+            setattr(run, name, value)
+        run.updated_at = self._now()
+        self._session.flush()
+        return run
+
+    def add_window(
+        self,
+        *,
+        run_id: str,
+        idx: int,
+        first: int,
+        core_first: int,
+        core_last: int,
+        last: int,
+        state: str = "pending",
+    ) -> AnalysisWindow:
+        """A window of the run: the units ``first..last`` by ordinal, of which the core
+        ``core_first..core_last`` belongs to it. ``first <= core_first <= core_last <= last`` and
+        ``state`` are DB CHECKs. A new window has no attempts and no repair."""
+        window = AnalysisWindow(
+            id=new_id(),
+            run_id=run_id,
+            idx=idx,
+            first=first,
+            core_first=core_first,
+            core_last=core_last,
+            last=last,
+            state=state,
+            attempts=0,
+            repair_used=False,
+            error_code=None,
+            result_json=None,
+        )
+        self._session.add(window)
+        self._session.flush()
+        return window
+
+    def update_window(self, window_id: str, **changes: Any) -> AnalysisWindow:
+        """Only ``ANALYSIS_WINDOW_MUTABLE_FIELDS``; the run, the index and the unit span are
+        fixed."""
+        unknown = sorted(set(changes) - ANALYSIS_WINDOW_MUTABLE_FIELDS)
+        if unknown:
+            raise ValueError(f"Непідтримувані поля вікна аналізу: {', '.join(unknown)}")
+        window = self._session.get(AnalysisWindow, window_id)
+        if window is None:
+            raise RecordNotFound("analysis_window", window_id)
+        for name, value in changes.items():
+            setattr(window, name, value)
+        self._session.flush()
+        return window
+
+    def list_windows(self, run_id: str) -> list[AnalysisWindow]:
+        """Windows of the run in index order."""
+        statement = (
+            select(AnalysisWindow)
+            .where(AnalysisWindow.run_id == run_id)
+            .order_by(AnalysisWindow.idx)
+        )
+        return list(self._session.scalars(statement))
+
+    def add_attempt(
+        self,
+        *,
+        window_id: str,
+        kind: str,
+        state: str,
+        request_id: str | None = None,
+        spend_entry_id: str | None = None,
+        http_status: int | None = None,
+        error_code: str | None = None,
+        raw_output: str | None = None,
+        usage_json: Mapping[str, Any] | None = None,
+    ) -> AnalysisAttempt:
+        """One request of a window. ``kind`` and ``state`` are DB CHECKs; ``raw_output`` may be at
+        most 1 048 576 UTF-8 bytes (a DB CHECK)."""
+        attempt = AnalysisAttempt(
+            id=new_id(),
+            window_id=window_id,
+            kind=kind,
+            request_id=request_id,
+            spend_entry_id=spend_entry_id,
+            state=state,
+            http_status=http_status,
+            error_code=error_code,
+            raw_output=raw_output,
+            usage_json=dict(usage_json) if usage_json is not None else None,
+            created_at=self._now(),
+        )
+        self._session.add(attempt)
+        self._session.flush()
+        return attempt
+
+    def update_attempt(self, attempt_id: str, **changes: Any) -> AnalysisAttempt:
+        """Only ``ANALYSIS_ATTEMPT_MUTABLE_FIELDS``; the window, the kind and the creation time are
+        fixed."""
+        unknown = sorted(set(changes) - ANALYSIS_ATTEMPT_MUTABLE_FIELDS)
+        if unknown:
+            raise ValueError(f"Непідтримувані поля спроби аналізу: {', '.join(unknown)}")
+        attempt = self._session.get(AnalysisAttempt, attempt_id)
+        if attempt is None:
+            raise RecordNotFound("analysis_attempt", attempt_id)
+        for name, value in changes.items():
+            setattr(attempt, name, value)
+        self._session.flush()
+        return attempt
+
+    def list_attempts(self, window_id: str) -> list[AnalysisAttempt]:
+        """Attempts of the window in the order they were made: by ``created_at``, then by the SQLite
+        rowid, which grows with each insert. Ids are random and say nothing about the order, and two
+        attempts can share one clock tick, so the id never decides (ADR 041 §22 (7))."""
+        statement = (
+            select(AnalysisAttempt)
+            .where(AnalysisAttempt.window_id == window_id)
+            .order_by(AnalysisAttempt.created_at, literal_column("analysis_attempts.rowid"))
         )
         return list(self._session.scalars(statement))
 

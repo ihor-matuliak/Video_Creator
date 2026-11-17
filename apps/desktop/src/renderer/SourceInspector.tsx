@@ -8,6 +8,7 @@ import {
   formatResolution,
   vfrBadge,
 } from './source-format';
+import { SearchPanel } from './SearchPanel';
 import { TranscriptImport } from './TranscriptImport';
 import { TranscriptionPanel } from './TranscriptionPanel';
 import { StatusText } from './ui';
@@ -103,8 +104,10 @@ export function SourceInspector({ source }: { readonly source: SourceDto }) {
       <p className="note" data-testid="source-local-note">
         Відео залишається на цьому комп&apos;ютері. Для транскрипції надсилається вибране аудіо.
       </p>
-      <TranscriptionPanel key={source.id} source={source} availability={source.availability} />
-      <TranscriptImport key={source.id} sourceId={source.id} />
+      {/* Sibling keys must differ: the same key on three siblings makes React reconcile them wrongly. */}
+      <TranscriptionPanel key={`transcription-${source.id}`} source={source} availability={source.availability} />
+      <TranscriptImport key={`import-${source.id}`} sourceId={source.id} />
+      <SearchPanel key={source.id} source={source} />
     </section>
   );
 }

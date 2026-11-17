@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 
 import type { ClipDto, ReviewStatus } from '../shared/api';
 import { formatTimecode } from '../shared/timecode';
+import { categoryLabel, priorityLabel } from './analysis-logic';
 import { HOTKEY_LABELS } from './hotkey-logic';
 import { StatusText } from './ui';
 import type { Tone } from './ui';
@@ -32,6 +33,42 @@ function shortcutProps(name: string, key: 'approve' | 'reject') {
     'aria-keyshortcuts': HOTKEY_LABELS[key].aria,
     title: `${name} (${HOTKEY_LABELS[key].title})`,
   };
+}
+
+/**
+ * The marks a clip found by a run carries on its card (ADR 041 §23(7)): categories, priority and two
+ * warnings. The caller shows it only when `analysis_run_id` is set; a manual clip has none of them.
+ */
+function AiMarks({ clip }: { readonly clip: ClipDto }) {
+  const priority = priorityLabel(clip.rank);
+  return (
+    <div className="clip-ai" data-testid="clip-ai">
+      {clip.categories.length > 0 && (
+        <ul className="clip-chips" aria-label="Категорії">
+          {clip.categories.map((id) => (
+            <li key={id} className="clip-chip" data-testid="clip-chip">
+              {categoryLabel(id)}
+            </li>
+          ))}
+        </ul>
+      )}
+      {priority !== null && (
+        <p className="clip-priority" data-testid="clip-priority">
+          {priority}
+        </p>
+      )}
+      {clip.visual_review_required && (
+        <StatusText tone="warning" testId="clip-visual-review">
+          Перевірити картинку
+        </StatusText>
+      )}
+      {clip.analysis_stale && (
+        <StatusText tone="warning" testId="clip-stale">
+          Оцінка застаріла
+        </StatusText>
+      )}
+    </div>
+  );
 }
 
 export interface ClipListProps {
@@ -133,6 +170,7 @@ export function ClipList({
                 {formatTimecode(clip.end_ms - clip.start_ms)} · {formatTimecode(clip.start_ms)}–
                 {formatTimecode(clip.end_ms)}
               </p>
+              {clip.analysis_run_id !== null && <AiMarks clip={clip} />}
               <StatusText tone={label.tone} testId="clip-review-status">
                 {label.text}
               </StatusText>

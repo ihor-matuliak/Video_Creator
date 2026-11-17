@@ -73,6 +73,7 @@ const CLIP = {
   export_state: 'none',
   created_at: '2026-11-14T10:00:00Z',
   updated_at: '2026-11-14T10:00:00Z',
+  analysis_stale: false,
 };
 
 const ESTIMATE = {
@@ -517,6 +518,19 @@ describe('response parsers', () => {
     expect(parseClip({ ...CLIP, scores: null }).scores).toBeNull();
   });
 
+  it('parseClip requires analysis_stale as a boolean and keeps its value (ADR 041 §11)', () => {
+    const withoutStale = Object.fromEntries(
+      Object.entries(CLIP).filter(([key]) => key !== 'analysis_stale'),
+    );
+
+    expect(parseClip({ ...CLIP, analysis_stale: true }).analysis_stale).toBe(true);
+    expect(parseClip(CLIP).analysis_stale).toBe(false);
+    expect(() => parseClip(withoutStale)).toThrow(/поле analysis_stale$/);
+    for (const stale of ['false', 0, null, undefined]) {
+      expect(() => parseClip({ ...CLIP, analysis_stale: stale })).toThrow(/поле analysis_stale$/);
+    }
+  });
+
   it('parsePage parses every item', () => {
     expect(parsePage(parseProject)({ items: [PROJECT], next_cursor: 'c' })).toEqual({
       items: [PROJECT],
@@ -617,6 +631,9 @@ describe('response parsers', () => {
     [parseClip, { ...CLIP, scores: { funny: 'high' } }],
     [parseClip, { ...CLIP, categories: 'funny' }],
     [parseClip, { ...CLIP, revision: Number.NaN }],
+    [parseClip, { ...CLIP, analysis_stale: undefined }],
+    [parseClip, { ...CLIP, analysis_stale: 'false' }],
+    [parseClip, { ...CLIP, analysis_stale: null }],
     [parseJob, { id: ID, type: 'x', state: 'y', progress: 5, error: null }],
   ] as const)('rejects a malformed value %#', (parse, value) => {
     expect(() => {
@@ -628,6 +645,219 @@ describe('response parsers', () => {
     expect(() => parseProject({ ...PROJECT, name: { secret: 'tok-123' } })).toThrow(
       /поле name$/,
     );
+  });
+});
+
+describe('analysis parsers (ADR 041 §10, §21)', () => {
+  const ESTIMATE_A = {
+    model: 'test/selector',
+    unit_level: 'word',
+    unit_count: 240,
+    window_count: 2,
+    estimate_micro_usd: 3_600,
+    prompt_usd_per_mtok: '1.00',
+    completion_usd_per_mtok: '2.00',
+    max_tokens: 4096,
+    price_basis: 'test',
+    budget_usd: '2.50',
+    within_budget: true,
+  };
+  const CREATED_A = { id: ID, job_id: ID, status: 'queued' };
+  const WINDOWS = { total: 2, succeeded: 1, failed: 0, unknown_outcome: 0, pending: 1 };
+  const RUN_A = {
+    id: ID,
+    source_id: ID,
+    transcript_id: ID,
+    transcript_revision: 2,
+    model: 'test/selector',
+    provider: 'test',
+    prompt_version: 'sha256:0123456789abcdef',
+    schema_version: 1,
+    unit_level: 'word',
+    status: 'running',
+    error_code: null,
+    created_at: '2026-11-17T10:00:00Z',
+    updated_at: '2026-11-17T10:05:00Z',
+    job_id: ID,
+    committed_micro_usd: 1_200,
+    windows: WINDOWS,
+    clip_ids: [ID],
+    stale: false,
+    diagnostics_summary: { dropped: { LOW_QUALITY: 2 }, suppressed: { already_reviewed: 1 } },
+  };
+  const ITEM_A = {
+    id: ID,
+    source_id: ID,
+    transcript_id: ID,
+    transcript_revision: 2,
+    model: 'test/selector',
+    status: 'completed',
+    error_code: 'ANALYSIS_UNKNOWN_OUTCOME',
+    job_id: ID,
+    committed_micro_usd: 1_200,
+    created_at: '2026-11-17T10:00:00Z',
+  };
+
+  it('analysis.estimate keeps its eleven fields and drops every other key', () => {
+    const parse = API_DATA_PARSERS['analysis.estimate'];
+
+    expect(parse({ ...ESTIMATE_A, profile: {}, openrouter_api_key: 'k'.repeat(30) })).toEqual(
+      ESTIMATE_A,
+    );
+    expect(parse({ ...ESTIMATE_A, budget_usd: null, within_budget: null })).toEqual({
+      ...ESTIMATE_A,
+      budget_usd: null,
+      within_budget: null,
+    });
+  });
+
+  it('analysis.estimate refuses a missing field and a wrong type', () => {
+    const parse = API_DATA_PARSERS['analysis.estimate'];
+
+    for (const bad of [
+      null,
+      [],
+      {},
+      { ...ESTIMATE_A, model: undefined },
+      { ...ESTIMATE_A, model: null },
+      { ...ESTIMATE_A, unit_level: 5 },
+      { ...ESTIMATE_A, unit_count: '240' },
+      { ...ESTIMATE_A, unit_count: -1 },
+      { ...ESTIMATE_A, window_count: 1.5 },
+      { ...ESTIMATE_A, estimate_micro_usd: '3600' },
+      { ...ESTIMATE_A, estimate_micro_usd: undefined },
+      { ...ESTIMATE_A, prompt_usd_per_mtok: 1 },
+      { ...ESTIMATE_A, completion_usd_per_mtok: null },
+      { ...ESTIMATE_A, max_tokens: -4096 },
+      { ...ESTIMATE_A, price_basis: undefined },
+      { ...ESTIMATE_A, budget_usd: 2.5 },
+      { ...ESTIMATE_A, budget_usd: undefined },
+      { ...ESTIMATE_A, within_budget: 'yes' },
+      { ...ESTIMATE_A, within_budget: undefined },
+    ]) {
+      expect(() => parse(bad)).toThrow(TypeError);
+    }
+    expect(() => parse({ ...ESTIMATE_A, budget_usd: 2.5 })).toThrow(/поле budget_usd$/);
+  });
+
+  it('analysis.create keeps the id of the run and of its job, and drops every other key', () => {
+    const parse = API_DATA_PARSERS['analysis.create'];
+
+    expect(parse({ ...CREATED_A, source_id: ID, extra: 1 })).toEqual(CREATED_A);
+    for (const bad of [
+      null,
+      {},
+      { id: ID },
+      { ...CREATED_A, job_id: null },
+      { ...CREATED_A, job_id: 5 },
+      { ...CREATED_A, status: undefined },
+      { ...CREATED_A, id: 1 },
+    ]) {
+      expect(() => parse(bad)).toThrow(TypeError);
+    }
+  });
+
+  it('analysis.get keeps the run with its windows, clips and diagnostics, and drops every other key', () => {
+    const parse = API_DATA_PARSERS['analysis.get'];
+
+    expect(
+      parse({
+        ...RUN_A,
+        openrouter_api_key: 'k'.repeat(30),
+        windows: { ...WINDOWS, extra: 1 },
+      }),
+    ).toEqual(RUN_A);
+    expect(parse({ ...RUN_A, error_code: null, job_id: null })).toMatchObject({
+      error_code: null,
+      job_id: null,
+    });
+    expect(parse({ ...RUN_A, stale: true, diagnostics_summary: {}, clip_ids: [] })).toMatchObject({
+      stale: true,
+      diagnostics_summary: {},
+      clip_ids: [],
+    });
+  });
+
+  it('analysis.get refuses a missing field and a wrong type, in the run, the windows or the diagnostics', () => {
+    const parse = API_DATA_PARSERS['analysis.get'];
+
+    for (const bad of [
+      null,
+      [],
+      {},
+      { ...RUN_A, transcript_revision: '2' },
+      { ...RUN_A, transcript_revision: -1 },
+      { ...RUN_A, schema_version: 1.5 },
+      { ...RUN_A, provider: undefined },
+      { ...RUN_A, status: null },
+      { ...RUN_A, error_code: 5 },
+      { ...RUN_A, error_code: undefined },
+      { ...RUN_A, job_id: 7 },
+      { ...RUN_A, committed_micro_usd: '1200' },
+      { ...RUN_A, committed_micro_usd: -1 },
+      { ...RUN_A, windows: undefined },
+      { ...RUN_A, windows: null },
+      { ...RUN_A, windows: { ...WINDOWS, pending: undefined } },
+      { ...RUN_A, windows: { ...WINDOWS, total: '2' } },
+      { ...RUN_A, windows: { ...WINDOWS, failed: -1 } },
+      { ...RUN_A, clip_ids: 'x' },
+      { ...RUN_A, clip_ids: [5] },
+      { ...RUN_A, clip_ids: undefined },
+      { ...RUN_A, stale: 'no' },
+      { ...RUN_A, stale: undefined },
+      { ...RUN_A, diagnostics_summary: undefined },
+      { ...RUN_A, diagnostics_summary: null },
+      { ...RUN_A, diagnostics_summary: [] },
+      { ...RUN_A, diagnostics_summary: { dropped: 2 } },
+      { ...RUN_A, diagnostics_summary: { dropped: null } },
+      { ...RUN_A, diagnostics_summary: { dropped: { LOW_QUALITY: '2' } } },
+      { ...RUN_A, diagnostics_summary: { dropped: { LOW_QUALITY: -1 } } },
+      { ...RUN_A, diagnostics_summary: { dropped: { LOW_QUALITY: 1.5 } } },
+      { ...RUN_A, diagnostics_summary: { dropped: { LOW_QUALITY: [1] } } },
+      { ...RUN_A, created_at: 5 },
+    ]) {
+      expect(() => parse(bad)).toThrow(TypeError);
+    }
+    expect(() => parse({ ...RUN_A, windows: { ...WINDOWS, pending: undefined } })).toThrow(
+      /поле windows$/,
+    );
+    expect(() =>
+      parse({ ...RUN_A, diagnostics_summary: { dropped: { LOW_QUALITY: '2' } } }),
+    ).toThrow(/поле diagnostics_summary$/);
+  });
+
+  it('analysis.list keeps the runs without their windows, clips and diagnostics, and drops every other key', () => {
+    const parse = API_DATA_PARSERS['analysis.list'];
+
+    expect(parse({ items: [{ ...ITEM_A, windows: WINDOWS, clip_ids: [] }], extra: 1 })).toEqual({
+      items: [ITEM_A],
+    });
+    expect(parse({ items: [{ ...ITEM_A, error_code: null, job_id: null }] })).toEqual({
+      items: [{ ...ITEM_A, error_code: null, job_id: null }],
+    });
+    expect(parse({ items: [] })).toEqual({ items: [] });
+  });
+
+  it('analysis.list refuses an answer that is not {items} of runs', () => {
+    const parse = API_DATA_PARSERS['analysis.list'];
+
+    for (const bad of [
+      null,
+      [],
+      {},
+      { items: null },
+      { items: {} },
+      { items: [null] },
+      { items: [{ ...ITEM_A, created_at: 5 }] },
+      { items: [{ ...ITEM_A, transcript_id: undefined }] },
+      { items: [{ ...ITEM_A, transcript_revision: '2' }] },
+      { items: [{ ...ITEM_A, committed_micro_usd: '1' }] },
+      { items: [{ ...ITEM_A, status: 1 }] },
+      { items: [{ ...ITEM_A, job_id: 7 }] },
+      { items: [{ ...ITEM_A, error_code: undefined }] },
+    ]) {
+      expect(() => parse(bad)).toThrow(TypeError);
+    }
   });
 });
 

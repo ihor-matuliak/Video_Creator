@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from httpx2 import Response
 
 from clipforge.services.runtime import Runtime
-from clipforge.storage import ClipRepository
+from clipforge.storage import AnalysisRunRepository, ClipRepository
 
 from .support import client_for
 from .test_storage_support import add_project, add_source
@@ -595,3 +595,110 @@ def test_rejected_bounds_do_not_touch_the_export_state(
     set_export_state(runtime, clip["id"], "verified")
     assert patch(client, clip, end_ms=DURATION_MS + 1).status_code == 422
     assert client.get(f"/v1/clips/{clip['id']}").json()["export_state"] == "verified"
+
+
+# --- analysis_stale (ADR 041 §11) ----------------------------------------------------------------
+
+PRICE = {"prompt_usd_per_mtok": "1", "completion_usd_per_mtok": "2", "max_tokens": 4096}
+
+
+def import_transcript(client: TestClient, source_id: str) -> dict[str, Any]:
+    document = {
+        "schema_version": 1,
+        "timing_level": "word",
+        "language": "en",
+        "duration_ms": DURATION_MS,
+        "words": [
+            {"id": "w1", "ordinal": 0, "start_ms": 4000, "end_ms": 4500, "text": "hello"},
+            {"id": "w2", "ordinal": 1, "start_ms": 4500, "end_ms": 5000, "text": "world"},
+        ],
+        "segments": [
+            {"id": "s1", "ordinal": 0, "start_ms": 4000, "end_ms": 5000, "text": "hello world"}
+        ],
+        "coverage": [{"start_ms": 0, "end_ms": DURATION_MS, "state": "succeeded"}],
+    }
+    response = client.post(
+        "/v1/transcripts/import",
+        json={"source_id": source_id, "format": "normalized_json", "document": document},
+    )
+    assert response.status_code == 201, response.text
+    transcript: dict[str, Any] = response.json()
+    return transcript
+
+
+def seed_analysis_clip(runtime: Runtime, source_id: str, transcript_id: str, revision: int) -> str:
+    """A clip that a completed analysis run read ``transcript_id`` at ``revision`` suggested. No
+    route creates such a clip before the run endpoints of M4, so the rows are written directly."""
+    with runtime.database.write_session() as session:
+        run = AnalysisRunRepository(session).add_run(
+            source_id=source_id,
+            transcript_id=transcript_id,
+            transcript_revision=revision,
+            profile_json={"categories": ["funny"]},
+            model="test/selector",
+            provider="openrouter",
+            prompt_version="sha256:0000000000000000",
+            schema_version=1,
+            unit_level="word",
+            price_snapshot_json=PRICE,
+            status="completed",
+        )
+        clip = ClipRepository(session).add(
+            source_id=source_id,
+            title="Із аналізу",
+            start_ms=3_000,
+            end_ms=6_000,
+            categories=["funny"],
+            evidence_type="transcript",
+            evidence_ids=["w1"],
+            analysis_run_id=run.id,
+            evidence_start_ms=4_000,
+            evidence_end_ms=5_000,
+        )
+        return clip.id
+
+
+def test_a_manual_clip_is_not_analysis_stale(client: TestClient, source_id: str) -> None:
+    clip = create(client, source_id)
+    assert clip["analysis_stale"] is False
+    assert client.get(f"/v1/clips/{clip['id']}").json()["analysis_stale"] is False
+
+
+def test_a_clip_of_a_run_on_the_newest_revision_is_not_stale(
+    client: TestClient, runtime: Runtime, source_id: str
+) -> None:
+    transcript = import_transcript(client, source_id)
+    clip_id = seed_analysis_clip(runtime, source_id, transcript["id"], transcript["revision"])
+    stored = client.get(f"/v1/clips/{clip_id}").json()
+    assert stored["analysis_run_id"] is not None
+    assert stored["analysis_stale"] is False
+
+
+def test_a_correction_makes_the_run_clip_stale_and_moves_no_bounds(
+    client: TestClient, runtime: Runtime, source_id: str
+) -> None:
+    transcript = import_transcript(client, source_id)
+    clip_id = seed_analysis_clip(runtime, source_id, transcript["id"], transcript["revision"])
+    manual = create(client, source_id)
+    before = client.get(f"/v1/clips/{clip_id}").json()
+    assert before["analysis_stale"] is False
+
+    correction = client.post(
+        f"/v1/transcripts/{transcript['id']}/corrections",
+        json={"edits": [{"word_id": "w1", "text": "hi"}]},
+    )
+    assert correction.status_code == 201, correction.text
+    assert correction.json()["revision"] == 2
+
+    after = client.get(f"/v1/clips/{clip_id}").json()
+    assert after["analysis_stale"] is True
+    assert after["start_ms"] == before["start_ms"] == 3_000
+    assert after["end_ms"] == before["end_ms"] == 6_000
+    assert after["revision"] == before["revision"]
+
+    # The flag is per clip, and the page of one source shows both clips with their own flags.
+    page = client.get("/v1/clips", params={"source_id": source_id}).json()["items"]
+    assert {item["id"]: item["analysis_stale"] for item in page} == {
+        clip_id: True,
+        manual["id"]: False,
+    }

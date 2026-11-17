@@ -79,6 +79,12 @@ class ClipService:
         with self._database.session() as session:
             return _require_clip(ClipRepository(session), clip_id)
 
+    def analysis_stale_ids(self, clips: Sequence[Clip]) -> frozenset[str]:
+        """Which of ``clips`` are analysis-stale (ADR 041 §11), read in one session whatever the
+        number of clips."""
+        with self._database.session() as session:
+            return ClipRepository(session).analysis_stale_ids(clips)
+
     def list_page(
         self,
         *,

@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { ApiParams, JobDto, TranscriptionRunDto } from '../shared/api';
 import type { ApiErrorInfo, ApiResult } from '../shared/bridge';
 import { callApi } from './bridge-calls';
+import { notifyTranscriptChanged } from './transcript-events';
 import { deriveView, isJobOpen, openStage } from './transcription-logic';
 import type { Snapshot, TranscriptionView } from './transcription-logic';
 import { useViewActive } from './view-active';
@@ -236,7 +237,12 @@ export function useTranscription(sourceId: string, audioIndex: number, fileReady
         schedule(0);
         return;
       }
-      // Over: the block reads its state once more and schedules no poll after this.
+      // Over: the job has closed, so the transcript may have a new revision and the panels that read it
+      // are told (ADR 041 §23(10)). This watch sends no poll after this, so the event comes once per close.
+      if (read?.ok === true) {
+        notifyTranscriptChanged(sourceId);
+      }
+      // The block reads its state once more and schedules no poll after this.
       setRequest({ clears: null });
     }
 
@@ -245,7 +251,7 @@ export function useTranscription(sourceId: string, audioIndex: number, fileReady
       watch.stopped = true;
       window.clearTimeout(timer);
     };
-  }, [active, key, watchedRunId]);
+  }, [active, key, sourceId, watchedRunId]);
 
   /** Reads the state again: the runs, the estimate and the settings. */
   const requestRead = (): void => {

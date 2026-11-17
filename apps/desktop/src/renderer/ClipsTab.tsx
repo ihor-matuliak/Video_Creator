@@ -4,6 +4,7 @@ import type { ClipDto, ReviewStatus, SourceDto } from '../shared/api';
 import type { ApiErrorInfo } from '../shared/bridge';
 import { callApi } from './bridge-calls';
 import { ClipEditor } from './ClipEditor';
+import { ClipInsight } from './ClipInsight';
 import { ClipList } from './ClipList';
 import { nextClipToReview } from './clip-edit-logic';
 import { DetailsPanel } from './DetailsPanel';
@@ -455,40 +456,43 @@ function SourceWorkspace({
 
   const editor =
     activeClip !== undefined ? (
-      <ClipEditor
-        key={activeClip.id}
-        clip={activeClip}
-        view={editing.viewOf(activeClip)}
-        saveState={editing.saveStateOf(activeClip.id)}
-        canUndo={editing.canUndo(activeClip.id)}
-        durationMs={source.duration_ms}
-        player={playerRef}
-        playerReady={playerReady}
-        onTitleChange={(text) => {
-          editing.changeTitle(activeClip, text);
-        }}
-        onBoundChange={(bound, text) => {
-          editing.changeBound(activeClip, bound, text);
-        }}
-        onCommit={() => {
-          editing.commit(activeClip);
-        }}
-        onTakeFromPlayer={(bound) => {
-          setBoundFromPlayer(bound);
-        }}
-        onStep={(bound, deltaMs) => {
-          editing.stepBound(activeClip, bound, deltaMs);
-        }}
-        onUndo={() => {
-          editing.undo(activeClip);
-        }}
-        onResave={() => {
-          editing.resave(activeClip);
-        }}
-        onTakeStored={() => {
-          editing.takeStored(activeClip.id);
-        }}
-      />
+      <>
+        <ClipInsight clip={activeClip} />
+        <ClipEditor
+          key={activeClip.id}
+          clip={activeClip}
+          view={editing.viewOf(activeClip)}
+          saveState={editing.saveStateOf(activeClip.id)}
+          canUndo={editing.canUndo(activeClip.id)}
+          durationMs={source.duration_ms}
+          player={playerRef}
+          playerReady={playerReady}
+          onTitleChange={(text) => {
+            editing.changeTitle(activeClip, text);
+          }}
+          onBoundChange={(bound, text) => {
+            editing.changeBound(activeClip, bound, text);
+          }}
+          onCommit={() => {
+            editing.commit(activeClip);
+          }}
+          onTakeFromPlayer={(bound) => {
+            setBoundFromPlayer(bound);
+          }}
+          onStep={(bound, deltaMs) => {
+            editing.stepBound(activeClip, bound, deltaMs);
+          }}
+          onUndo={() => {
+            editing.undo(activeClip);
+          }}
+          onResave={() => {
+            editing.resave(activeClip);
+          }}
+          onTakeStored={() => {
+            editing.takeStored(activeClip.id);
+          }}
+        />
+      </>
     ) : formOpen ? (
       <ManualClipForm
         ref={formRef}

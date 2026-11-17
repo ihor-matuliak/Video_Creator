@@ -6,6 +6,7 @@ from fastapi import FastAPI
 
 from clipforge import __version__
 from clipforge.api import (
+    analysis_runs,
     clips,
     exports,
     health,
@@ -40,6 +41,7 @@ def create_app(config: Config, *, port: int, runtime: Runtime) -> FastAPI:
     install_error_handlers(app)
     app.include_router(health.build_router(config), prefix="/v1")
     for module in (
+        analysis_runs,
         projects,
         sources,
         previews,

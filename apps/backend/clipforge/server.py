@@ -33,6 +33,7 @@ from clipforge.adapters.media_tools import (
 from clipforge.api.app import create_app
 from clipforge.api.security import LOOPBACK_HOST
 from clipforge.config import Config, ConfigError, load_config
+from clipforge.services.analysis_jobs import openrouter_chat_factory
 from clipforge.services.credentials import openrouter_key_checker
 from clipforge.services.runtime import Runtime
 from clipforge.services.transcription_jobs import openrouter_stt_factory
@@ -86,7 +87,9 @@ def _start_runtime(config: Config) -> Runtime | None:
             config.data_dir,
             media_tools=media_tools,
             stt_client_factory=openrouter_stt_factory(config),
+            chat_client_factory=openrouter_chat_factory(config),
             key_checker=openrouter_key_checker(config),
+            mode=config.mode,
         )
     except StorageError as exc:
         # Storage messages are Ukrainian and free of paths and stored values.

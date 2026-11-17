@@ -33,7 +33,9 @@ class JobCancel(BaseModel):
 class JobResume(BaseModel):
     """``retry_unknown`` is the user's explicit decision to send again the requests whose outcome
     is unknown (they may already have been paid for); without it they are not sent. ``budget_usd``
-    replaces the budget ceiling of a ``transcription`` run (the service checks its value)."""
+    replaces the budget ceiling of a ``transcription`` or ``analysis`` run. A non-string
+    ``budget_usd`` (a number, a bool) is a schema 422 here, before the service; the service checks
+    the value of the string by the rule of the settings (ADR 041 §23 (8))."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 

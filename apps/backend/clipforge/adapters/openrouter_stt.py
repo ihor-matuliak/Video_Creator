@@ -4,7 +4,7 @@
 turns the answer into an ``SttResult``. One call is one attempt: retries, Retry-After
 waits, backoff, splitting a chunk and the budget belong to the orchestrator. A call that
 may already have been processed (a write/read timeout or a broken connection after the
-request left) is ``unknown_outcome`` and is never repeated here.
+request left, or a 408/504 answer) is ``unknown_outcome`` and is never repeated here.
 
 Two models are supported: ``microsoft/mai-transcribe-2`` (provider options go under
 ``provider.options.azure``) and ``google/gemini-3.5-transcribe`` (no provider options).
@@ -362,7 +362,11 @@ def _kind_for_status(status: int) -> SttErrorKind | None:
         return "payload_too_large"
     if status == 429:
         return "rate_limited"
-    if status == 408 or 500 <= status <= 599:
+    # A timeout answer after the request left: the provider may have processed and billed it
+    # (ADR 041 §22). Never repeated without the user's decision.
+    if status in (408, 504):
+        return "unknown_outcome"
+    if 500 <= status <= 599:
         return "upstream"
     if 400 <= status <= 499:
         return "invalid_request"

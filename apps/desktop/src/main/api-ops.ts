@@ -5,7 +5,15 @@ import {
   isUuid4,
   isVideoToken,
 } from '../shared/api';
-import type { ApiOp, ApiParams, ExportProfile, ReviewStatus, TranscriptEdit } from '../shared/api';
+import type {
+  AnalysisProfile,
+  AnalysisRunParams,
+  ApiOp,
+  ApiParams,
+  ExportProfile,
+  ReviewStatus,
+  TranscriptEdit,
+} from '../shared/api';
 import type { ImportTranscriptParams, ImportVideoParams, OpenFolderParams } from '../shared/bridge';
 import type { ApiMethod } from './sidecar-protocol';
 
@@ -239,6 +247,46 @@ export function parseProfile(value: unknown): ExportProfile {
     write_srt: bool(source.write_srt),
   };
 }
+
+/**
+ * A string of any length. The length of a custom instruction is the backend's to check: it counts
+ * code points and answers 422 for `profile.custom_instruction`.
+ */
+const anyText: Check<string> = (value) => (typeof value === 'string' ? value : invalid());
+
+/**
+ * The search profile of an analysis run (ADR 041 §10, §21): exactly the six documented keys, each of
+ * its shape. The values and bounds (categories 1 to 5, the durations, max_candidates) are the
+ * backend's, which names the bad one as `profile.<field>`.
+ */
+function parseAnalysisProfile(value: unknown): AnalysisProfile {
+  const source = exact(value, [
+    'categories',
+    'custom_instruction',
+    'min_duration_ms',
+    'max_duration_ms',
+    'max_candidates',
+    'allow_partial',
+  ]);
+  return {
+    categories: listOf(anyText)(source.categories),
+    custom_instruction: anyText(source.custom_instruction),
+    min_duration_ms: int(source.min_duration_ms),
+    max_duration_ms: int(source.max_duration_ms),
+    max_candidates: int(source.max_candidates),
+    allow_partial: bool(source.allow_partial),
+  };
+}
+
+/** The params of `analysis.estimate` and `analysis.create`: a transcript of one source, and the profile. */
+const analysisRunParams: Check<AnalysisRunParams> = (raw) => {
+  const p = exact(raw, ['source_id', 'transcript_id', 'profile']);
+  return {
+    source_id: uuid(p.source_id),
+    transcript_id: uuid(p.transcript_id),
+    profile: parseAnalysisProfile(p.profile),
+  };
+};
 
 type Builder = (params: unknown) => ApiPlan;
 
@@ -559,6 +607,36 @@ const BUILDERS: Readonly<Record<ApiOp, Builder>> = {
       path: `/v1/transcripts/${p.id}/corrections`,
       body: { edits: p.edits },
     }),
+  ),
+
+  // ADR 041 §21: the model and the budget are not params; the backend takes both from the settings,
+  // as for a transcription run, so a run always matches the Settings screen.
+  'analysis.estimate': define<ApiParams['analysis.estimate']>(
+    analysisRunParams,
+    (p) => ({
+      method: 'POST',
+      path: '/v1/analysis-runs/estimate',
+      body: { source_id: p.source_id, transcript_id: p.transcript_id, profile: p.profile },
+    }),
+  ),
+
+  'analysis.create': define<ApiParams['analysis.create']>(
+    analysisRunParams,
+    (p) => ({
+      method: 'POST',
+      path: '/v1/analysis-runs',
+      body: { source_id: p.source_id, transcript_id: p.transcript_id, profile: p.profile },
+    }),
+  ),
+
+  'analysis.get': define<ApiParams['analysis.get']>(
+    (raw) => ({ id: uuid(exact(raw, ['id']).id) }),
+    (p) => ({ method: 'GET', path: `/v1/analysis-runs/${p.id}` }),
+  ),
+
+  'analysis.list': define<ApiParams['analysis.list']>(
+    (raw) => ({ source_id: uuid(exact(raw, ['source_id']).source_id) }),
+    (p) => ({ method: 'GET', path: withQuery('/v1/analysis-runs', { source_id: p.source_id }) }),
   ),
 
   // ADR 039: the key check takes no params. The key is held by the sidecar and never sent by

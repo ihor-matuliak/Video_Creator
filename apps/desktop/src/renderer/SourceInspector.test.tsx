@@ -1,5 +1,5 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { act, fireEvent, render, renderHook, screen } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
 
 import { PLAYBACK_REASONS } from '../shared/api';
 import type { SourceDto, TranscriptDto, TranscriptionEstimateDto } from '../shared/api';
@@ -7,6 +7,7 @@ import { apiFailure } from '../shared/bridge';
 import type { ImportTranscriptResult } from '../shared/bridge';
 import { SourceInspector } from './SourceInspector';
 import { NO_KEY, SOURCE_ID, deferred, flushAnswers, installBridge, makeSettings, makeSource, ok } from './test-bridge';
+import { useTranscriptChanged } from './transcript-events';
 
 function show(source: SourceDto): void {
   render(<SourceInspector source={source} />);
@@ -342,5 +343,52 @@ describe('SourceInspector: importing subtitles (ADR 039)', () => {
     rerender(<SourceInspector source={makeSource({ id: OTHER_SOURCE_ID })} />);
     expect(screen.queryByTestId('transcript-import-result')).toBeNull();
     expect(screen.getByRole('button', { name: IMPORT })).toBeEnabled();
+  });
+
+  it('tells the listeners of its source once, after a successful import (ADR 041 §23(10))', async () => {
+    const heard = vi.fn();
+    renderHook(() => {
+      useTranscriptChanged(SOURCE_ID, heard);
+    });
+    installBridge({ importTranscript: () => ok(REVISION) });
+    render(<SourceInspector source={makeSource()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: IMPORT }));
+
+    await screen.findByTestId('transcript-import-result');
+    expect(heard).toHaveBeenCalledTimes(1);
+  });
+
+  it('tells nobody when the dialog is cancelled (ADR 041 §23(10))', async () => {
+    const heard = vi.fn();
+    renderHook(() => {
+      useTranscriptChanged(SOURCE_ID, heard);
+    });
+    installBridge({ importTranscript: () => ({ canceled: true }) });
+    render(<SourceInspector source={makeSource()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: IMPORT }));
+    await act(async () => {
+      await flushAnswers();
+    });
+
+    expect(screen.getByRole('button', { name: IMPORT })).toBeEnabled();
+    expect(heard).not.toHaveBeenCalled();
+  });
+
+  it('tells nobody when the import fails (ADR 041 §23(10))', async () => {
+    const heard = vi.fn();
+    renderHook(() => {
+      useTranscriptChanged(SOURCE_ID, heard);
+    });
+    installBridge({
+      importTranscript: () => apiFailure('TRANSCRIPT_FILE_UNSUPPORTED', 'Оберіть файл субтитрів у форматі SRT або VTT'),
+    });
+    render(<SourceInspector source={makeSource()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: IMPORT }));
+
+    expect(await screen.findByTestId('transcript-import-error')).toBeVisible();
+    expect(heard).not.toHaveBeenCalled();
   });
 });

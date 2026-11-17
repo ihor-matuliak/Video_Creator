@@ -23,6 +23,16 @@ const PROFILE = {
   write_srt: false,
 };
 
+/** The search profile of an analysis run (ADR 041 §10): exactly the six keys. */
+const ANALYSIS_PROFILE = {
+  categories: ['funny', 'action'],
+  custom_instruction: 'Лише сцени з репліками',
+  min_duration_ms: 15000,
+  max_duration_ms: 90000,
+  max_candidates: 20,
+  allow_partial: false,
+};
+
 describe('buildPlan: every op maps to one fixed method and path', () => {
   const cases: readonly (readonly [ApiOp, unknown, unknown])[] = [
     ['projects.list', {}, { method: 'GET', path: '/v1/projects' }],
@@ -262,6 +272,30 @@ describe('buildPlan: every op maps to one fixed method and path', () => {
       },
     ],
     [
+      'analysis.estimate',
+      { source_id: ID, transcript_id: ID2, profile: ANALYSIS_PROFILE },
+      {
+        method: 'POST',
+        path: '/v1/analysis-runs/estimate',
+        body: { source_id: ID, transcript_id: ID2, profile: ANALYSIS_PROFILE },
+      },
+    ],
+    [
+      'analysis.create',
+      { source_id: ID, transcript_id: ID2, profile: ANALYSIS_PROFILE },
+      {
+        method: 'POST',
+        path: '/v1/analysis-runs',
+        body: { source_id: ID, transcript_id: ID2, profile: ANALYSIS_PROFILE },
+      },
+    ],
+    ['analysis.get', { id: ID }, { method: 'GET', path: `/v1/analysis-runs/${ID}` }],
+    [
+      'analysis.list',
+      { source_id: ID },
+      { method: 'GET', path: `/v1/analysis-runs?source_id=${ID}` },
+    ],
+    [
       'credentials.check',
       {},
       { method: 'POST', path: '/v1/runtime/credentials/check' },
@@ -374,6 +408,12 @@ describe('buildPlan: ids must be uuid4', () => {
     ['transcripts.list', 'source_id'],
     ['transcripts.get', 'id'],
     ['transcripts.correct', 'id'],
+    ['analysis.estimate', 'source_id'],
+    ['analysis.estimate', 'transcript_id'],
+    ['analysis.create', 'source_id'],
+    ['analysis.create', 'transcript_id'],
+    ['analysis.get', 'id'],
+    ['analysis.list', 'source_id'],
   ];
   const valid: Readonly<Record<string, unknown>> = {
     'projects.update': { id: ID },
@@ -395,6 +435,10 @@ describe('buildPlan: ids must be uuid4', () => {
     'transcripts.list': { source_id: ID },
     'transcripts.get': { id: ID },
     'transcripts.correct': { id: ID, edits: [{ word_id: 'w1', text: 'a' }] },
+    'analysis.estimate': { source_id: ID, transcript_id: ID2, profile: ANALYSIS_PROFILE },
+    'analysis.create': { source_id: ID, transcript_id: ID2, profile: ANALYSIS_PROFILE },
+    'analysis.get': { id: ID },
+    'analysis.list': { source_id: ID },
   };
 
   it.each(idOps)('%s rejects a bad %s', (op, key) => {
@@ -775,6 +819,24 @@ describe('buildPlan: the renderer cannot pass a path, output_dir or evidence_typ
         ...extra,
       }),
     ).toThrow(ParamError);
+    expect(() =>
+      buildPlan('analysis.estimate', {
+        source_id: ID,
+        transcript_id: ID2,
+        profile: ANALYSIS_PROFILE,
+        ...extra,
+      }),
+    ).toThrow(ParamError);
+    expect(() =>
+      buildPlan('analysis.create', {
+        source_id: ID,
+        transcript_id: ID2,
+        profile: ANALYSIS_PROFILE,
+        ...extra,
+      }),
+    ).toThrow(ParamError);
+    expect(() => buildPlan('analysis.get', { id: ID, ...extra })).toThrow(ParamError);
+    expect(() => buildPlan('analysis.list', { source_id: ID, ...extra })).toThrow(ParamError);
     expect(() => buildPlan('credentials.check', extra)).toThrow(ParamError);
   });
 
@@ -817,6 +879,149 @@ describe('buildPlan: the renderer cannot pass a path, output_dir or evidence_typ
 
     expect(() => buildPlan('sources.get', params)).toThrow(ParamError);
     expect(() => buildPlan('sources.list', listParams)).toThrow(ParamError);
+  });
+});
+
+describe('buildPlan: analysis runs (ADR 041 §10, §21)', () => {
+  const full = { source_id: ID, transcript_id: ID2, profile: ANALYSIS_PROFILE };
+  const run = (profile: unknown) => buildPlan('analysis.create', { ...full, profile });
+
+  it('estimate and create send the transcript and the profile, and nothing else', () => {
+    const estimate = buildPlan('analysis.estimate', full);
+    const create = buildPlan('analysis.create', full);
+
+    expect(estimate.path).toBe('/v1/analysis-runs/estimate');
+    expect(create.path).toBe('/v1/analysis-runs');
+    expect(Object.keys(estimate.body ?? {}).sort()).toEqual(['profile', 'source_id', 'transcript_id']);
+    expect(Object.keys(create.body ?? {}).sort()).toEqual(['profile', 'source_id', 'transcript_id']);
+  });
+
+  it('refuses a model or a budget as a param of either op: the backend takes both from the settings', () => {
+    for (const op of ['analysis.estimate', 'analysis.create'] as const) {
+      for (const extra of [
+        { model: 'test/selector' },
+        { budget_usd: '1.00' },
+        { budget_usd: 1 },
+        { openrouter_api_key: 'k'.repeat(30) },
+      ]) {
+        expect(() => buildPlan(op, { ...full, ...extra })).toThrow(ParamError);
+      }
+    }
+  });
+
+  it.each(['source_id', 'transcript_id', 'profile'])('refuses a missing or undefined %s', (key) => {
+    const absent = Object.fromEntries(Object.entries(full).filter(([name]) => name !== key));
+
+    for (const op of ['analysis.estimate', 'analysis.create'] as const) {
+      expect(() => buildPlan(op, absent)).toThrow(ParamError);
+      expect(() => buildPlan(op, { ...full, [key]: undefined })).toThrow(ParamError);
+    }
+  });
+
+  it.each([[null], [undefined], [[]], ['profile'], [5], [true]])(
+    'refuses a profile that is %j: it must be a plain object',
+    (profile) => {
+      expect(() => run(profile)).toThrow(ParamError);
+    },
+  );
+
+  it('refuses a profile that is an instance of a class, even with the six fields', () => {
+    class Profile {
+      readonly marker = 1;
+    }
+    const profile: unknown = Object.setPrototypeOf({ ...ANALYSIS_PROFILE }, Profile.prototype);
+
+    expect(() => run(profile)).toThrow(ParamError);
+  });
+
+  it.each(Object.keys(ANALYSIS_PROFILE))('refuses a profile without %s, or with it undefined', (key) => {
+    const absent = Object.fromEntries(
+      Object.entries(ANALYSIS_PROFILE).filter(([name]) => name !== key),
+    );
+
+    expect(() => run(absent)).toThrow(ParamError);
+    expect(() => run({ ...ANALYSIS_PROFILE, [key]: undefined })).toThrow(ParamError);
+  });
+
+  it.each(['model', 'budget_usd', 'max_tokens', 'profile_id', 'path', 'evidence_type'])(
+    'refuses a profile with the extra key %s',
+    (key) => {
+      expect(() => run({ ...ANALYSIS_PROFILE, [key]: 'x' })).toThrow(ParamError);
+    },
+  );
+
+  it('refuses an own __proto__ key in the profile', () => {
+    const profile: unknown = JSON.parse(
+      `${JSON.stringify(ANALYSIS_PROFILE).slice(0, -1)},"__proto__":{"x":1}}`,
+    );
+
+    expect(() => run(profile)).toThrow(ParamError);
+  });
+
+  it.each([
+    ['categories', 'funny'],
+    ['categories', ['funny', 1]],
+    ['categories', null],
+    ['categories', {}],
+    ['custom_instruction', 5],
+    ['custom_instruction', null],
+    ['custom_instruction', ['x']],
+    ['min_duration_ms', '15000'],
+    ['min_duration_ms', 1.5],
+    ['min_duration_ms', Number.NaN],
+    ['min_duration_ms', null],
+    ['max_duration_ms', '90000'],
+    ['max_duration_ms', 90000.5],
+    ['max_candidates', '20'],
+    ['max_candidates', 2.5],
+    ['max_candidates', Number.POSITIVE_INFINITY],
+    ['max_candidates', null],
+    ['allow_partial', 'false'],
+    ['allow_partial', 0],
+    ['allow_partial', 1],
+    ['allow_partial', null],
+  ] as const)('refuses a profile whose %s is %j', (key, value) => {
+    expect(() => run({ ...ANALYSIS_PROFILE, [key]: value })).toThrow(ParamError);
+  });
+
+  it('sends the profile as typed: values and bounds are the backend’s to check, so a value it refuses is still sent', () => {
+    const profile = {
+      ...ANALYSIS_PROFILE,
+      categories: [],
+      custom_instruction: 'а'.repeat(2001),
+      min_duration_ms: 1,
+      max_candidates: 0,
+    };
+
+    expect(run(profile).body).toEqual({ source_id: ID, transcript_id: ID2, profile });
+  });
+
+  it.each([
+    ['analysis.get', {}],
+    ['analysis.get', undefined],
+    ['analysis.get', { id: ID, source_id: ID }],
+    ['analysis.get', { id: ID, limit: 5 }],
+    ['analysis.get', [{ id: ID }]],
+    ['analysis.list', {}],
+    ['analysis.list', undefined],
+    ['analysis.list', { id: ID }],
+    ['analysis.list', { source_id: ID, limit: 5 }],
+    ['analysis.list', { source_id: ID, cursor: 'c' }],
+    ['analysis.list', { source_id: ID, include_archived: true }],
+  ] as const)('refuses %s %j', (op, params) => {
+    expect(() => buildPlan(op, params)).toThrow(ParamError);
+  });
+
+  it('analysis.get and analysis.list take exactly their key and send no body', () => {
+    expect(buildPlan('analysis.get', { id: ID })).toEqual({
+      method: 'GET',
+      path: `/v1/analysis-runs/${ID}`,
+    });
+    expect(buildPlan('analysis.list', { source_id: ID })).toEqual({
+      method: 'GET',
+      path: `/v1/analysis-runs?source_id=${ID}`,
+    });
+    expect(buildPlan('analysis.list', { source_id: ID }).body).toBeUndefined();
   });
 });
 

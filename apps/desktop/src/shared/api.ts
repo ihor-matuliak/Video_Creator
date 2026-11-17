@@ -33,6 +33,10 @@ export const API_OPS = [
   'transcripts.list',
   'transcripts.get',
   'transcripts.correct',
+  'analysis.estimate',
+  'analysis.create',
+  'analysis.get',
+  'analysis.list',
   'credentials.check',
 ] as const;
 
@@ -216,6 +220,19 @@ export interface ApiParams {
    */
   readonly 'transcripts.correct': { readonly id: string; readonly edits: readonly TranscriptEdit[] };
   /**
+   * What an AI selection run over one transcript would cost (ADR 041 §10, §21). The model and the
+   * budget are not params: the backend takes them from the settings. Nothing is written or sent.
+   */
+  readonly 'analysis.estimate': AnalysisRunParams;
+  /**
+   * Starts a run (202 with its job). The model and the budget come from the settings, as for a
+   * transcription run; the budget of a started run is changed later through `jobs.resume`.
+   */
+  readonly 'analysis.create': AnalysisRunParams;
+  readonly 'analysis.get': { readonly id: string };
+  /** All runs of one source, the newest first. */
+  readonly 'analysis.list': { readonly source_id: string };
+  /**
    * Checks the key that the sidecar holds, with OpenRouter (ADR 039). Takes no params: the key
    * never leaves the sidecar and is not in any op.
    */
@@ -226,6 +243,28 @@ export interface ApiParams {
 export type TranscriptEdit =
   | { readonly word_id: string; readonly text: string }
   | { readonly segment_id: string; readonly text: string };
+
+/**
+ * The search profile of an analysis run (ADR 041 §10): exactly these six keys. The renderer sends
+ * them as typed; the backend checks the values and the bounds (422 names `profile.<field>`).
+ */
+export interface AnalysisProfile {
+  /** Categories of the closed set; the backend asks for 1 to 5, unique. */
+  readonly categories: readonly string[];
+  /** Kept as typed and passed to the model as data only. */
+  readonly custom_instruction: string;
+  readonly min_duration_ms: number;
+  readonly max_duration_ms: number;
+  readonly max_candidates: number;
+  readonly allow_partial: boolean;
+}
+
+/** Params of `analysis.estimate` and `analysis.create`: one transcript of a source, and the profile. */
+export interface AnalysisRunParams {
+  readonly source_id: string;
+  readonly transcript_id: string;
+  readonly profile: AnalysisProfile;
+}
 
 export interface Page<T> {
   readonly items: readonly T[];
@@ -344,6 +383,11 @@ export interface ClipDto {
   readonly export_state: string;
   readonly created_at: string;
   readonly updated_at: string;
+  /**
+   * Derived, never stored (ADR 041 §11): the clip's run read an older transcript revision than the
+   * newest one of its source. Required: a clip answer without it is malformed.
+   */
+  readonly analysis_stale: boolean;
 }
 
 export interface ExportCreatedDto {
@@ -516,6 +560,89 @@ export interface TranscriptionRunListDto {
   readonly items: readonly TranscriptionRunItemDto[];
 }
 
+/**
+ * The answer of POST /v1/analysis-runs/estimate (ADR 041 §10). `estimate_micro_usd` is the sum of
+ * the first requests' reserves: an upper estimate, not a bound on the bill. The prices are the
+ * decimal strings the backend sends as they are.
+ */
+export interface AnalysisEstimateDto {
+  readonly model: string;
+  readonly unit_level: string;
+  readonly unit_count: number;
+  readonly window_count: number;
+  readonly estimate_micro_usd: number;
+  readonly prompt_usd_per_mtok: string;
+  readonly completion_usd_per_mtok: string;
+  readonly max_tokens: number;
+  readonly price_basis: string;
+  /** A decimal string such as "2.50"; null: no ceiling is set in the settings. */
+  readonly budget_usd: string | null;
+  /** null when there is no budget to compare with. */
+  readonly within_budget: boolean | null;
+}
+
+/** The answer of POST /v1/analysis-runs (202): the run and its job. */
+export interface AnalysisRunCreatedDto {
+  readonly id: string;
+  readonly job_id: string;
+  readonly status: string;
+}
+
+/** The windows of a run by state. `pending` counts the windows that are running or cancelled too. */
+export interface AnalysisWindowCountsDto {
+  readonly total: number;
+  readonly succeeded: number;
+  readonly failed: number;
+  readonly unknown_outcome: number;
+  readonly pending: number;
+}
+
+/**
+ * One run (ADR 041 §10). `stale`: the run read an older transcript revision than the newest one of
+ * its source. `diagnostics_summary`: section, then reason, then count (ADR 041 §17).
+ */
+export interface AnalysisRunDto {
+  readonly id: string;
+  readonly source_id: string;
+  readonly transcript_id: string;
+  readonly transcript_revision: number;
+  readonly model: string;
+  readonly provider: string;
+  readonly prompt_version: string;
+  readonly schema_version: number;
+  readonly unit_level: string;
+  readonly status: string;
+  readonly error_code: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+  readonly job_id: string | null;
+  readonly committed_micro_usd: number;
+  readonly windows: AnalysisWindowCountsDto;
+  /** The clips the run made, in the order the aggregation inserted them. */
+  readonly clip_ids: readonly string[];
+  readonly stale: boolean;
+  readonly diagnostics_summary: Readonly<Record<string, Readonly<Record<string, number>>>>;
+}
+
+/** A run in a list: its figures without the windows, the clips and the diagnostics. */
+export interface AnalysisRunItemDto {
+  readonly id: string;
+  readonly source_id: string;
+  readonly transcript_id: string;
+  readonly transcript_revision: number;
+  readonly model: string;
+  readonly status: string;
+  readonly error_code: string | null;
+  readonly job_id: string | null;
+  readonly committed_micro_usd: number;
+  readonly created_at: string;
+}
+
+/** GET /v1/analysis-runs has no pages: the runs of one source are few. */
+export interface AnalysisRunListDto {
+  readonly items: readonly AnalysisRunItemDto[];
+}
+
 /** A span of the source's time with the coverage state of the transcript (ADR 030). */
 export interface TranscriptCoverageSpanDto {
   readonly start_ms: number;
@@ -622,6 +749,10 @@ export interface ApiData {
   readonly 'transcripts.list': Page<TranscriptDto>;
   readonly 'transcripts.get': TranscriptDetailDto;
   readonly 'transcripts.correct': TranscriptDto;
+  readonly 'analysis.estimate': AnalysisEstimateDto;
+  readonly 'analysis.create': AnalysisRunCreatedDto;
+  readonly 'analysis.get': AnalysisRunDto;
+  readonly 'analysis.list': AnalysisRunListDto;
   readonly 'credentials.check': CredentialCheckDto;
 }
 
@@ -780,6 +911,7 @@ export const parseClip: Parse<ClipDto> = (value) => {
     export_state: field(source, 'export_state', text),
     created_at: field(source, 'created_at', text),
     updated_at: field(source, 'updated_at', text),
+    analysis_stale: field(source, 'analysis_stale', bool),
   };
 };
 
@@ -1104,6 +1236,107 @@ const parseCredentialCheck: Parse<CredentialCheckDto> = (value) => {
   };
 };
 
+const parseAnalysisEstimate: Parse<AnalysisEstimateDto> = (value) => {
+  const source = record(value);
+  return {
+    model: field(source, 'model', text),
+    unit_level: field(source, 'unit_level', text),
+    unit_count: field(source, 'unit_count', count),
+    window_count: field(source, 'window_count', count),
+    estimate_micro_usd: field(source, 'estimate_micro_usd', count),
+    prompt_usd_per_mtok: field(source, 'prompt_usd_per_mtok', text),
+    completion_usd_per_mtok: field(source, 'completion_usd_per_mtok', text),
+    max_tokens: field(source, 'max_tokens', count),
+    price_basis: field(source, 'price_basis', text),
+    budget_usd: field(source, 'budget_usd', nullable(text)),
+    within_budget: field(source, 'within_budget', nullable(bool)),
+  };
+};
+
+const parseAnalysisRunCreated: Parse<AnalysisRunCreatedDto> = (value) => {
+  const source = record(value);
+  return {
+    id: field(source, 'id', text),
+    job_id: field(source, 'job_id', text),
+    status: field(source, 'status', text),
+  };
+};
+
+const parseWindowCounts: Parse<AnalysisWindowCountsDto> = (value) => {
+  const source = record(value);
+  return {
+    total: field(source, 'total', count),
+    succeeded: field(source, 'succeeded', count),
+    failed: field(source, 'failed', count),
+    unknown_outcome: field(source, 'unknown_outcome', count),
+    pending: field(source, 'pending', count),
+  };
+};
+
+/** A map of whole, non-negative counts. Built with `fromEntries`, so a key such as `__proto__` stays a key. */
+const countsOf: Parse<Readonly<Record<string, number>>> = (value) =>
+  Object.fromEntries(
+    Object.entries(record(value)).map(([reason, n]): [string, number] => [reason, count(n)]),
+  );
+
+/** `diagnostics_summary`: section, then reason, then count (ADR 041 §17). */
+const parseDiagnosticsSummary: Parse<
+  Readonly<Record<string, Readonly<Record<string, number>>>>
+> = (value) =>
+  Object.fromEntries(
+    Object.entries(record(value)).map(
+      ([section, reasons]): [string, Readonly<Record<string, number>>] => [
+        section,
+        countsOf(reasons),
+      ],
+    ),
+  );
+
+const parseAnalysisRun: Parse<AnalysisRunDto> = (value) => {
+  const source = record(value);
+  return {
+    id: field(source, 'id', text),
+    source_id: field(source, 'source_id', text),
+    transcript_id: field(source, 'transcript_id', text),
+    transcript_revision: field(source, 'transcript_revision', count),
+    model: field(source, 'model', text),
+    provider: field(source, 'provider', text),
+    prompt_version: field(source, 'prompt_version', text),
+    schema_version: field(source, 'schema_version', count),
+    unit_level: field(source, 'unit_level', text),
+    status: field(source, 'status', text),
+    error_code: field(source, 'error_code', nullable(text)),
+    created_at: field(source, 'created_at', text),
+    updated_at: field(source, 'updated_at', text),
+    job_id: field(source, 'job_id', nullable(text)),
+    committed_micro_usd: field(source, 'committed_micro_usd', count),
+    windows: field(source, 'windows', parseWindowCounts),
+    clip_ids: field(source, 'clip_ids', list(text)),
+    stale: field(source, 'stale', bool),
+    diagnostics_summary: field(source, 'diagnostics_summary', parseDiagnosticsSummary),
+  };
+};
+
+const parseAnalysisRunItem: Parse<AnalysisRunItemDto> = (value) => {
+  const source = record(value);
+  return {
+    id: field(source, 'id', text),
+    source_id: field(source, 'source_id', text),
+    transcript_id: field(source, 'transcript_id', text),
+    transcript_revision: field(source, 'transcript_revision', count),
+    model: field(source, 'model', text),
+    status: field(source, 'status', text),
+    error_code: field(source, 'error_code', nullable(text)),
+    job_id: field(source, 'job_id', nullable(text)),
+    committed_micro_usd: field(source, 'committed_micro_usd', count),
+    created_at: field(source, 'created_at', text),
+  };
+};
+
+const parseAnalysisRunList: Parse<AnalysisRunListDto> = (value) => ({
+  items: field(record(value), 'items', list(parseAnalysisRunItem)),
+});
+
 /** Parser of the `data` of a successful result, per op. */
 export const API_DATA_PARSERS: { readonly [O in ApiOp]: Parse<ApiData[O]> } = {
   'projects.list': parsePage(parseProjectListItem),
@@ -1133,5 +1366,9 @@ export const API_DATA_PARSERS: { readonly [O in ApiOp]: Parse<ApiData[O]> } = {
   'transcripts.list': parsePage(parseTranscript),
   'transcripts.get': parseTranscriptDetail,
   'transcripts.correct': parseTranscript,
+  'analysis.estimate': parseAnalysisEstimate,
+  'analysis.create': parseAnalysisRunCreated,
+  'analysis.get': parseAnalysisRun,
+  'analysis.list': parseAnalysisRunList,
   'credentials.check': parseCredentialCheck,
 };

@@ -237,6 +237,65 @@ const TRANSCRIPTION_RUN = {
   ],
 };
 
+/** The search profile of the analysis ops: exactly the six keys (ADR 041 §10). */
+const ANALYSIS_PROFILE = {
+  categories: ['funny', 'action'],
+  custom_instruction: '',
+  min_duration_ms: 15000,
+  max_duration_ms: 90000,
+  max_candidates: 20,
+  allow_partial: false,
+};
+/** What POST /v1/analysis-runs/estimate answers (ADR 041 §10). */
+const ANALYSIS_ESTIMATE = {
+  model: 'test/selector',
+  unit_level: 'word',
+  unit_count: 240,
+  window_count: 2,
+  estimate_micro_usd: 3_600,
+  prompt_usd_per_mtok: '1.00',
+  completion_usd_per_mtok: '2.00',
+  max_tokens: 4096,
+  price_basis: 'test',
+  budget_usd: '2.50',
+  within_budget: true,
+};
+/** What GET /v1/analysis-runs/{id} answers: the run with its windows, clips and diagnostics. */
+const ANALYSIS_RUN = {
+  id: ID,
+  source_id: ID2,
+  transcript_id: ID,
+  transcript_revision: 2,
+  model: 'test/selector',
+  provider: 'test',
+  prompt_version: 'sha256:0123456789abcdef',
+  schema_version: 1,
+  unit_level: 'word',
+  status: 'completed',
+  error_code: null,
+  created_at: '2026-11-17T10:00:00Z',
+  updated_at: '2026-11-17T10:05:00Z',
+  job_id: ID,
+  committed_micro_usd: 1_200,
+  windows: { total: 2, succeeded: 2, failed: 0, unknown_outcome: 0, pending: 0 },
+  clip_ids: [ID2],
+  stale: false,
+  diagnostics_summary: { dropped: { LOW_QUALITY: 2 }, suppressed: { already_reviewed: 1 } },
+};
+/** One run of GET /v1/analysis-runs?source_id=: its figures only. */
+const ANALYSIS_ITEM = {
+  id: ID,
+  source_id: ID2,
+  transcript_id: ID,
+  transcript_revision: 2,
+  model: 'test/selector',
+  status: 'completed',
+  error_code: null,
+  job_id: ID,
+  committed_micro_usd: 1_200,
+  created_at: '2026-11-17T10:00:00Z',
+};
+
 afterEach(async () => {
   await stopAllSidecars();
 });
@@ -364,6 +423,10 @@ describe('api:call allowlist', () => {
       'transcripts.list': { items: [TRANSCRIPT], next_cursor: null },
       'transcripts.get': TRANSCRIPT_WINDOW,
       'transcripts.correct': TRANSCRIPT,
+      'analysis.estimate': ANALYSIS_ESTIMATE,
+      'analysis.create': CREATED,
+      'analysis.get': ANALYSIS_RUN,
+      'analysis.list': { items: [ANALYSIS_ITEM] },
       'credentials.check': { state: 'valid', is_free_tier: false, limit_remaining_usd: '4.25' },
     };
     const params: Readonly<Record<ApiOp, unknown>> = {
@@ -394,6 +457,10 @@ describe('api:call allowlist', () => {
       'transcripts.list': { source_id: ID2 },
       'transcripts.get': { id: ID, offset: 0, limit: 200 },
       'transcripts.correct': { id: ID, edits: [{ word_id: 'w1', text: 'Привіт' }] },
+      'analysis.estimate': { source_id: ID, transcript_id: ID2, profile: ANALYSIS_PROFILE },
+      'analysis.create': { source_id: ID, transcript_id: ID2, profile: ANALYSIS_PROFILE },
+      'analysis.get': { id: ID },
+      'analysis.list': { source_id: ID2 },
       'credentials.check': {},
     };
     const { gateway, request, showOpenDialog } = setup();
@@ -445,6 +512,10 @@ describe('api:call allowlist', () => {
       `GET /v1/transcripts?source_id=${ID2}`,
       `GET /v1/transcripts/${ID}?offset=0&limit=200`,
       `POST /v1/transcripts/${ID}/corrections`,
+      'POST /v1/analysis-runs/estimate',
+      'POST /v1/analysis-runs',
+      `GET /v1/analysis-runs/${ID}`,
+      `GET /v1/analysis-runs?source_id=${ID2}`,
       'POST /v1/runtime/credentials/check',
     ]);
   });
@@ -549,6 +620,7 @@ describe('api:call params', () => {
     ['transcription.get', {}],
     ['transcripts.get', {}],
     ['transcripts.correct', { edits: [{ word_id: 'w1', text: 'a' }] }],
+    ['analysis.get', {}],
   ];
 
   it.each(withId)('%s: a non-uuid id is rejected without a sidecar call', async (op, rest) => {
@@ -3036,6 +3108,81 @@ describe('transcription ops and jobs.resume (ADR 038)', () => {
   });
 });
 
+describe('analysis runs (ADR 041 §10, §21)', () => {
+  const base = { source_id: ID, transcript_id: ID2, profile: ANALYSIS_PROFILE };
+
+  it.each([
+    ['analysis.estimate', { ...base, model: 'test/selector' }],
+    ['analysis.estimate', { ...base, budget_usd: '1.00' }],
+    ['analysis.create', { ...base, budget_usd: 1 }],
+    ['analysis.create', { ...base, transcript_id: 'x' }],
+    ['analysis.create', { ...base, profile: { ...ANALYSIS_PROFILE, max_candidates: '20' } }],
+    ['analysis.create', { ...base, profile: { ...ANALYSIS_PROFILE, allow_partial: undefined } }],
+    ['analysis.create', { ...base, profile: { ...ANALYSIS_PROFILE, budget_usd: '1.00' } }],
+    ['analysis.get', { id: `${ID}/../health` }],
+    ['analysis.get', { id: ID, source_id: ID2 }],
+    ['analysis.list', { source_id: `${ID}&x=1` }],
+    ['analysis.list', { source_id: ID, limit: 5 }],
+  ] as const)('%s refuses %j without calling the sidecar', async (op, params) => {
+    const { gateway, request } = setup();
+
+    expect(await gateway.call(SENDER, { op, params })).toMatchObject({
+      ok: false,
+      error: { code: 'INVALID_PARAMS' },
+    });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('turns an answer of another shape into an error, for every analysis op', async () => {
+    const { gateway, request } = setup();
+    const broken: readonly (readonly [ApiOp, unknown, unknown])[] = [
+      ['analysis.estimate', base, { ...ANALYSIS_ESTIMATE, unit_count: '240' }],
+      ['analysis.create', base, { id: ID }],
+      ['analysis.get', { id: ID }, { ...ANALYSIS_RUN, windows: { total: 2 } }],
+      ['analysis.list', { source_id: ID2 }, { items: [{ ...ANALYSIS_ITEM, created_at: 5 }] }],
+    ];
+
+    for (const [op, params, data] of broken) {
+      request.mockResolvedValueOnce({ ok: true, data });
+
+      expect(await gateway.call(SENDER, { op, params }), op).toMatchObject({
+        ok: false,
+        error: { code: 'BAD_BACKEND_RESPONSE' },
+      });
+    }
+  });
+
+  it('answers a run with its stale flag and without any key the backend might add', async () => {
+    const { gateway, request } = setup();
+    request.mockResolvedValueOnce({
+      ok: true,
+      data: { ...ANALYSIS_RUN, stale: true, openrouter_api_key: 'k'.repeat(30) },
+    });
+
+    const result = await gateway.call(SENDER, { op: 'analysis.get', params: { id: ID } });
+
+    expect(result).toEqual({ ok: true, data: { ...ANALYSIS_RUN, stale: true } });
+    expect(JSON.stringify(result)).not.toContain('k'.repeat(30));
+  });
+
+  it('posts the run with its profile as typed, and no model or budget', async () => {
+    const { gateway, request } = setup();
+    request.mockResolvedValueOnce({ ok: true, data: CREATED });
+
+    expect(await gateway.call(SENDER, { op: 'analysis.create', params: base })).toEqual({
+      ok: true,
+      data: CREATED,
+    });
+    expect(request.mock.calls).toEqual([
+      [
+        'POST',
+        '/v1/analysis-runs',
+        { source_id: ID, transcript_id: ID2, profile: ANALYSIS_PROFILE },
+      ],
+    ]);
+  });
+});
+
 describe('transcripts, credentials and the resume budget (ADR 038, 039)', () => {
   it('jobs.resume sends the budget next to the decision, and only the params that were given', async () => {
     const { gateway, request } = setup();
@@ -3199,6 +3346,7 @@ const CLIP = {
   export_state: 'none',
   created_at: '2026-11-14T10:00:00Z',
   updated_at: '2026-11-14T10:00:00Z',
+  analysis_stale: false,
 };
 const EXPORT_BATCH = {
   id: ID,

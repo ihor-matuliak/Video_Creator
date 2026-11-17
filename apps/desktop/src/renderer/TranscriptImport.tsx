@@ -2,6 +2,7 @@ import { useState } from 'react';
 
 import type { ApiErrorInfo } from '../shared/bridge';
 import { importTranscript } from './bridge-calls';
+import { notifyTranscriptChanged } from './transcript-events';
 import { StatusText } from './ui';
 
 type Outcome =
@@ -34,6 +35,10 @@ export function TranscriptImport({ sourceId }: { readonly sourceId: string }) {
       setBusy(false);
       if ('canceled' in result) {
         return;
+      }
+      if (result.ok) {
+        // A new revision exists now: the panels that read this source's transcript are told (ADR 041 §23(10)).
+        notifyTranscriptChanged(sourceId);
       }
       setOutcome(
         result.ok

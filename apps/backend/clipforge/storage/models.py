@@ -63,6 +63,26 @@ SPEND_STATES: Final = (SPEND_RESERVED, SPEND_COMPLETED, SPEND_UNKNOWN_OUTCOME, S
 SPEND_COUNTS_ACTUAL: Final = (SPEND_COMPLETED,)  # the actual cost, else the reservation
 SPEND_COUNTS_RESERVED: Final = (SPEND_RESERVED, SPEND_UNKNOWN_OUTCOME)  # the reservation
 SPEND_COUNTS_NOTHING: Final = (SPEND_RELEASED,)
+# ADR 041 §8: the status of an analysis run, the state of one window, the kind of one request
+# (attempt). The ADR does not name the states of one attempt: they are the window states.
+ANALYSIS_RUN_STATUSES: Final = (
+    "queued",
+    "running",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+)
+ANALYSIS_WINDOW_STATES: Final = (
+    "pending",
+    "running",
+    "succeeded",
+    "failed",
+    "unknown_outcome",
+    "cancelled",
+)
+ANALYSIS_ATTEMPT_STATES: Final = ANALYSIS_WINDOW_STATES
+ANALYSIS_ATTEMPT_KINDS: Final = ("first", "repair")
 
 
 def _in(column: str, values: tuple[str, ...]) -> str:
@@ -127,6 +147,12 @@ class Clip(Base):
             "AND 0 <= recommended_start_ms AND recommended_start_ms < recommended_end_ms)",
             name="ck_clips_recommended_interval",
         ),
+        CheckConstraint(
+            "(evidence_start_ms IS NULL AND evidence_end_ms IS NULL) "
+            "OR (evidence_start_ms IS NOT NULL AND evidence_end_ms IS NOT NULL "
+            "AND 0 <= evidence_start_ms AND evidence_start_ms < evidence_end_ms)",
+            name="ck_clips_evidence_interval",
+        ),
         CheckConstraint("visual_review_required IN (0, 1)", name="ck_clips_visual_review_required"),
         CheckConstraint(_in("review_status", REVIEW_STATUSES), name="ck_clips_review_status"),
         CheckConstraint(_in("export_state", EXPORT_STATES), name="ck_clips_export_state"),
@@ -135,14 +161,19 @@ class Clip(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     source_id: Mapped[str] = mapped_column(ForeignKey("sources.id"), nullable=False)
-    # No foreign key yet: the analysis_runs table arrives with the analysis milestone.
-    analysis_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The analysis run that suggested the clip; NULL for a manual clip (ADR 041 §8).
+    analysis_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("analysis_runs.id"), nullable=True
+    )
     revision: Mapped[int] = mapped_column(Integer, nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     start_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     end_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     recommended_start_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     recommended_end_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Transcript span of the suggestion, [start, end) (ADR 041 §6); NULL for a manual clip.
+    evidence_start_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    evidence_end_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     categories: Mapped[list[str]] = mapped_column(VersionedJson, nullable=False)
     evidence_type: Mapped[str] = mapped_column(String, nullable=False)
     evidence_ids: Mapped[list[str]] = mapped_column(VersionedJson, nullable=False)
@@ -155,6 +186,104 @@ class Clip(Base):
     export_state: Mapped[str] = mapped_column(String, nullable=False, server_default="none")
     created_at: Mapped[str] = mapped_column(String, nullable=False)
     updated_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class AnalysisRun(Base):
+    """One AI selection run over a source (ADR 041 §8). It reads one transcript revision; its
+    windows and their attempts are rows of their own. ``status`` is ``ANALYSIS_RUN_STATUSES``."""
+
+    __tablename__ = "analysis_runs"
+    __table_args__ = (
+        CheckConstraint(_in("status", ANALYSIS_RUN_STATUSES), name="ck_analysis_runs_status"),
+        Index("ix_analysis_runs_source_id", "source_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    source_id: Mapped[str] = mapped_column(ForeignKey("sources.id"), nullable=False)
+    transcript_id: Mapped[str] = mapped_column(
+        ForeignKey("transcript_revisions.id"), nullable=False
+    )
+    # The number of the transcript revision that ``transcript_id`` names.
+    transcript_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    profile_json: Mapped[dict[str, Any]] = mapped_column(VersionedJson, nullable=False)
+    model: Mapped[str] = mapped_column(String, nullable=False)
+    provider: Mapped[str] = mapped_column(String, nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String, nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    unit_level: Mapped[str] = mapped_column(String, nullable=False)
+    price_snapshot_json: Mapped[dict[str, Any]] = mapped_column(VersionedJson, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Diagnostics of the run (ADR 041 §7); NULL until the run has them.
+    diagnostics_json: Mapped[dict[str, Any] | None] = mapped_column(VersionedJson, nullable=True)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+    updated_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class AnalysisWindow(Base):
+    """One analysis window of a run (ADR 041 §3): the units ``first..last`` by ordinal, of which
+    the core ``core_first..core_last`` belongs to this window. The states are
+    ``ANALYSIS_WINDOW_STATES``."""
+
+    __tablename__ = "analysis_windows"
+    __table_args__ = (
+        CheckConstraint(
+            "first <= core_first AND core_first <= core_last AND core_last <= last",
+            name="ck_analysis_windows_span",
+        ),
+        CheckConstraint(_in("state", ANALYSIS_WINDOW_STATES), name="ck_analysis_windows_state"),
+        CheckConstraint("attempts >= 0", name="ck_analysis_windows_attempts"),
+        CheckConstraint("repair_used IN (0, 1)", name="ck_analysis_windows_repair_used"),
+        UniqueConstraint("run_id", "idx", name="uq_analysis_windows_run_idx"),
+        Index("ix_analysis_windows_run_id", "run_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("analysis_runs.id"), nullable=False)
+    idx: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Ordinals of the transcript units (words or segments) of the run's revision.
+    first: Mapped[int] = mapped_column(Integer, nullable=False)
+    core_first: Mapped[int] = mapped_column(Integer, nullable=False)
+    core_last: Mapped[int] = mapped_column(Integer, nullable=False)
+    last: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(String, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False)
+    repair_used: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The candidates of the window that passed validation (ADR 041 §8); NULL until it has them.
+    result_json: Mapped[list[dict[str, Any]] | None] = mapped_column(VersionedJson, nullable=True)
+
+
+class AnalysisAttempt(Base):
+    """One request for a window: its first answer or its repair (ADR 041 §4). ``raw_output`` is
+    the answer kept for local diagnostics and never holds the key. ``state`` is
+    ``ANALYSIS_ATTEMPT_STATES``."""
+
+    __tablename__ = "analysis_attempts"
+    __table_args__ = (
+        CheckConstraint(_in("kind", ANALYSIS_ATTEMPT_KINDS), name="ck_analysis_attempts_kind"),
+        CheckConstraint(_in("state", ANALYSIS_ATTEMPT_STATES), name="ck_analysis_attempts_state"),
+        # The cap counts UTF-8 bytes (ADR 041 §14): length() of TEXT counts characters, so the
+        # value is cast to BLOB first.
+        CheckConstraint(
+            "length(CAST(raw_output AS BLOB)) <= 1048576", name="ck_analysis_attempts_raw_output"
+        ),
+        Index("ix_analysis_attempts_window_id", "window_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    window_id: Mapped[str] = mapped_column(ForeignKey("analysis_windows.id"), nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    request_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The spend-ledger entry that reserved the money of this request; no foreign key, as in
+    # SpendEntry.
+    spend_entry_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    state: Mapped[str] = mapped_column(String, nullable=False)
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    raw_output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    usage_json: Mapped[dict[str, Any] | None] = mapped_column(VersionedJson, nullable=True)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
 
 
 class ExportBatch(Base):

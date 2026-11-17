@@ -11,6 +11,11 @@ and without FFmpeg; the key is read from ``credentials`` only when a request is 
 
 ``key_checker`` says how the key is checked (``POST /v1/runtime/credentials/check``; production:
 ``openrouter_key_checker(config)``; without one every check is refused and nothing is sent).
+
+``chat_client_factory`` says how the key becomes an AI selection client (production:
+``openrouter_chat_factory(config)``; without one every analysis request is refused). ``mode`` is the
+mode of the process: it decides the models AI selection accepts and whether a key is required
+(ADR 041 §1–§2). It defaults to production, the stricter of the two.
 """
 
 from __future__ import annotations
@@ -18,6 +23,15 @@ from __future__ import annotations
 from pathlib import Path
 
 from clipforge.adapters.media_tools import MediaTools
+from clipforge.config import Mode
+from clipforge.services.analysis_jobs import (
+    ANALYSIS_JOB,
+    AnalysisJobService,
+    ChatClientFactory,
+    KeyedChatClient,
+    unconfigured_chat_factory,
+)
+from clipforge.services.analysis_runs import AnalysisRunService
 from clipforge.services.clips import ClipService
 from clipforge.services.credentials import (
     CredentialStore,
@@ -58,6 +72,8 @@ class Runtime:
         stt_client_factory: SttClientFactory | None = None,
         extract_audio: AudioExtractor | None = None,
         key_checker: KeyChecker | None = None,
+        chat_client_factory: ChatClientFactory | None = None,
+        mode: Mode = "production",
     ) -> None:
         self.database = database
         self.media_tools = media_tools
@@ -94,14 +110,28 @@ class Runtime:
             self.credentials,
             media_tools,
         )
+        self.analysis_runs = AnalysisRunService(
+            database,
+            self.spend,
+            client=KeyedChatClient(
+                self.credentials, chat_client_factory or unconfigured_chat_factory, mode=mode
+            ),
+        )
+        self.analysis_jobs = AnalysisJobService(
+            database, self.analysis_runs, self.settings, self.credentials, mode=mode
+        )
         self.jobs = JobService(
             database,
             {
                 EXPORT_JOB: self.exports.cancel,
                 PREVIEW_JOB: self.previews.cancel,
                 TRANSCRIPTION_JOB: self.transcription_jobs.cancel,
+                ANALYSIS_JOB: self.analysis_jobs.cancel,
             },
-            {TRANSCRIPTION_JOB: self.transcription_jobs.resume},
+            {
+                TRANSCRIPTION_JOB: self.transcription_jobs.resume,
+                ANALYSIS_JOB: self.analysis_jobs.resume,
+            },
         )
 
     @classmethod
@@ -113,6 +143,8 @@ class Runtime:
         stt_client_factory: SttClientFactory | None = None,
         extract_audio: AudioExtractor | None = None,
         key_checker: KeyChecker | None = None,
+        chat_client_factory: ChatClientFactory | None = None,
+        mode: Mode = "production",
     ) -> Runtime:
         """``media_tools`` is ``None`` when FFmpeg was not found: media routes then answer 503."""
         database = open_database(data_dir)
@@ -122,10 +154,13 @@ class Runtime:
             stt_client_factory=stt_client_factory,
             extract_audio=extract_audio,
             key_checker=key_checker,
+            chat_client_factory=chat_client_factory,
+            mode=mode,
         )
         try:
             runtime.runner.recover()
             runtime.transcription_jobs.recover()
+            runtime.analysis_jobs.recover()
             runtime.exports.recover()
             runtime.previews.recover()
         except BaseException:
@@ -136,7 +171,10 @@ class Runtime:
     def close(self) -> None:
         try:
             # First: nothing may be sent once the key is forgotten below.
-            self.transcription_jobs.shutdown()
+            try:
+                self.analysis_jobs.shutdown()
+            finally:
+                self.transcription_jobs.shutdown()
         finally:
             self.credentials.clear_openrouter_key()
             try:

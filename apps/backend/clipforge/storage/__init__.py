@@ -13,6 +13,9 @@ from .models import (
     SPEND_RELEASED,
     SPEND_RESERVED,
     SPEND_UNKNOWN_OUTCOME,
+    AnalysisAttempt,
+    AnalysisRun,
+    AnalysisWindow,
     AppSetting,
     Base,
     Clip,
@@ -30,6 +33,7 @@ from .models import (
     TranscriptWord,
 )
 from .repositories import (
+    AnalysisRunRepository,
     ClipRepository,
     ExportRepository,
     JobRepository,
@@ -51,6 +55,10 @@ __all__ = [
     "SPEND_RELEASED",
     "SPEND_RESERVED",
     "SPEND_UNKNOWN_OUTCOME",
+    "AnalysisAttempt",
+    "AnalysisRun",
+    "AnalysisRunRepository",
+    "AnalysisWindow",
     "AppSetting",
     "Base",
     "Clip",

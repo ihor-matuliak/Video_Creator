@@ -105,6 +105,7 @@ export function makeClip(overrides: Partial<ClipDto> = {}): ClipDto {
     export_state: 'none',
     created_at: '2026-11-14T10:05:00Z',
     updated_at: '2026-11-14T10:05:00Z',
+    analysis_stale: false,
     ...overrides,
   };
 }
