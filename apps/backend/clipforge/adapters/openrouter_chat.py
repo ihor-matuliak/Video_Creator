@@ -5,9 +5,9 @@ through ``OpenRouterChat``: one POST to ``<base>/chat/completions`` per call, on
 retried. Retries, the spend ledger and the checks of the selection output belong to the service
 layer.
 
-Only the models in ``analysis_profiles`` may be used (ADR 041 §1). The production table is
-empty until the owner's live probe confirms a model ID; the test table holds one fake model
-that only the loopback test provider serves.
+Only the models in ``analysis_profiles`` may be used (ADR 041 §1). The production table holds
+only models a live probe has confirmed; the test table holds one fake model that only the
+loopback test provider serves.
 
 The prompts and the selection schema come from ``clipforge.resources``, which holds byte copies
 of ``prompts/`` and ``contracts/``. ``PROMPT_VERSION`` is derived from those bytes.
@@ -67,7 +67,8 @@ class AnalysisProfile:
     """A model the selection may use (ADR 041 §1).
 
     The caps are USD per 1 000 000 tokens. ``max_tokens`` is the completion limit sent in the
-    body. ``price_basis`` says where the caps come from (``"test"`` for the fake model).
+    body. ``price_basis`` says where the caps come from (``"test"`` for the fake model, the
+    live-probe date for production).
     """
 
     model: str
@@ -78,7 +79,18 @@ class AnalysisProfile:
     price_basis: str
 
 
-_NO_PROFILES: Final[Mapping[str, AnalysisProfile]] = MappingProxyType({})
+_PRODUCTION_PROFILES: Final[Mapping[str, AnalysisProfile]] = MappingProxyType(
+    {
+        "anthropic/claude-haiku-5.5": AnalysisProfile(
+            model="anthropic/claude-haiku-5.5",
+            prompt_usd_per_mtok=Decimal("0.10"),
+            completion_usd_per_mtok=Decimal("0.50"),
+            context_tokens=1_000_000,
+            max_tokens=4096,
+            price_basis="openrouter-live-probe-2026-11-17",
+        ),
+    }
+)
 
 _TEST_PROFILES: Final[Mapping[str, AnalysisProfile]] = MappingProxyType(
     {
@@ -94,12 +106,13 @@ _TEST_PROFILES: Final[Mapping[str, AnalysisProfile]] = MappingProxyType(
 )
 
 _PROFILES_BY_MODE: Final[Mapping[Mode, Mapping[str, AnalysisProfile]]] = MappingProxyType(
-    {"production": _NO_PROFILES, "test": _TEST_PROFILES}
+    {"production": _PRODUCTION_PROFILES, "test": _TEST_PROFILES}
 )
 
 
 def analysis_profiles(mode: Mode) -> Mapping[str, AnalysisProfile]:
-    """The models allowed in ``mode``. Production has none until the live probe (ADR 041 §1)."""
+    """The models allowed in ``mode``. Production holds only models confirmed by a live probe
+    (ADR 041 §1, §24); test mode holds the fake ``test/selector`` only."""
     return _PROFILES_BY_MODE[mode]
 
 

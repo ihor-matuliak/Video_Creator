@@ -10,7 +10,7 @@
 | M1 | Виконано 2026-11-14; live STT, long-source, clean-machine — NOT RUN | Див. запис 2026-11-14 «M1 завершено» нижче |
 | M2 | Виконано 2026-11-15; live STT, long-source, clean-machine — NOT RUN; E2E-04 червоний до M4 | Див. запис 2026-11-15 «M2 завершено» нижче |
 | M3 | Виконано 2026-11-17 (`3b068f4`); live STT (Т5a), live `GET /key`, long-source, clean-machine — NOT RUN | Див. запис 2026-11-17 «Гейти M3 завершено» нижче |
-| M4 | Виконано 2026-11-17 (не закомічено); live analysis probe (Т10), live STT (Т5a), live `GET /key`, long-source, clean-machine — NOT RUN | Див. запис 2026-11-17 «M4 завершено» нижче |
+| M4 | Виконано 2026-11-17 (`dc09af3`); live analysis probe (Т10) — RUN, пройдено (`anthropic/claude-haiku-5.5`); live STT (Т5a), live `GET /key`, long-source, clean-machine — NOT RUN | Див. запис 2026-11-17 «M4 завершено» нижче |
 | M5 | Не розпочато | Повний user flow ще не інтегрований |
 | M6 | Не розпочато | Fault/security gates очікують реалізації |
 | M7 | Не розпочато | Потрібні матеріали власника та live API |
@@ -285,6 +285,9 @@
   - Backend: pytest 3165 passed; ruff, format (152 файли), `mypy --strict` (150 файлів) — чисто; `npm run qa:acceptance` 17/17 (T-031 ×2, T-033, T-035 тепер проходять); packaging smoke PASS (44,1 МіБ, ready 3,0 с).
   - Desktop: typecheck, lint — 0; Vitest 59 файлів, 2330 passed; build 0; apps/desktop e2e 47 passed; `npm run qa:e2e` 4/4 (E2E-04 зелений).
   - Рев'ю: бекенд (sonnet) і ще три раунди (haiku). High немає; кожне medium виправлено або записано в known-issues.
-- NOT RUN: живий probe моделі відбору (Т10, один платний запит власника; модель аналізу в production не вибрана — без неї пошук зупиняється з ANALYSIS_MODEL_REQUIRED); живе STT на матеріалі власника (Т5a); живий `GET /key`; long-source (M7); чиста машина (M8).
+- NOT RUN (Т10 закрито пізніше того ж дня, див. запис «Т10 live probe — RUN» нижче): живий probe моделі відбору (Т10, один платний запит власника; модель аналізу в production не вибрана — без неї пошук зупиняється з ANALYSIS_MODEL_REQUIRED); живе STT на матеріалі власника (Т5a); живий `GET /key`; long-source (M7); чиста машина (M8).
 - Відомі обмеження: див. known-issues. Головне — після зупинки на repair перша відповідь при resume оплачується вдруге (кандидат на M5). Блок «Додатково» в панелі пошуку відкладено (backlog). Якість відбору на реальному матеріалі не оцінювалась (потрібні live-модель і held-out ручна перевірка, M7).
 - Далі: M5 (повний user flow, docs/02). Коміт M4 очікує згоди власника.
+- 2026-11-17 M4 закомічено на main (`dc09af3`) за згодою власника, як і M3: `.agents/`, `.codex/`, `AGENTS.md` лишаються поза git. Ключ у тестах (`sk-or-v1-0123…`) фейковий, як і в M3. Далі: M5.
+- 2026-11-17 Т10 live probe — RUN, пройдено. Власник запустив `apps/backend/scripts/analysis_probe.py` для `anthropic/claude-haiku-5.5` (cap 0.10/0.50, context 1 000 000, max_tokens 4096): 200, stop, cost 0.0006617 USD, usage 2162/891, selection прийнято, `max_price` рядками прийнято, generation `gen-1794949286-xlodGvV0Wnmw6dR0UWX7`. Модель додано в production `analysis_profiles` (ADR 041 §24); інші моделі → 422. Гейти: pytest test_openrouter_chat, test_analysis_jobs, test_analysis_plan, test_analysis_runs, test_api_analysis_runs, test_analysis_probe — 321 passed, ruff/format/mypy --strict чисто, qa:acceptance 17/17, sidecar перезібрано (smoke PASS, ready 2.7 с). Якість відбору на реальному відео — NOT RUN. Профіль закомічено окремим комітом після `dc09af3` за згодою власника.
+- 2026-11-17 Кінець сесії. Стан: M0–M4 закомічено, AI-пошук у production працює з `anthropic/claude-haiku-5.5` (модель вводить власник у Налаштуваннях). NOT RUN: якість відбору на реальному відео, live STT (Т5a), live `GET /key`, long-source, clean-machine. Наступна сесія: M5 за docs/02; кандидати — docs/known-issues.md і docs/backlog.md.

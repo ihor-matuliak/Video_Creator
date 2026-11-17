@@ -123,11 +123,20 @@ def test_schema_version_is_1() -> None:
 # ------------------------------------------------------------------------- profiles
 
 
-def test_production_has_no_analysis_models() -> None:
+def test_production_offers_exactly_the_live_probed_haiku_profile() -> None:
     production = analysis_profiles("production")
 
     assert isinstance(production, MappingProxyType)
-    assert len(production) == 0
+    assert dict(production) == {
+        "anthropic/claude-haiku-5.5": AnalysisProfile(
+            model="anthropic/claude-haiku-5.5",
+            prompt_usd_per_mtok=Decimal("0.10"),
+            completion_usd_per_mtok=Decimal("0.50"),
+            context_tokens=1_000_000,
+            max_tokens=4096,
+            price_basis="openrouter-live-probe-2026-11-17",
+        )
+    }
     assert production.get("test/selector") is None
 
 

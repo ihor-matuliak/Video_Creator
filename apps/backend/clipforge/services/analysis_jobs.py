@@ -353,7 +353,7 @@ class AnalysisJobService:
         profiles: Mapping[str, AnalysisProfile] | None = None,
     ) -> None:
         """``profiles`` is the table of models the service accepts; ``None`` takes the table of
-        ``mode`` (production has none until the owner's live probe, ADR 041 §1)."""
+        ``mode`` (production: only live-probed models, ADR 041 §1, §24)."""
         self._database = database
         self._runs = runs
         self._settings = settings

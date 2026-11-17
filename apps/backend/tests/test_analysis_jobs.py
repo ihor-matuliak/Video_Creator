@@ -510,11 +510,19 @@ def test_the_model_must_be_given_and_must_be_in_the_table(
     assert written(lab) == (0, 0, 0)
 
 
-def test_production_has_no_model_until_the_live_probe_confirms_one(rig: Rig) -> None:
+def test_production_refuses_a_model_outside_the_table_and_writes_nothing(rig: Rig) -> None:
     lab = rig.build(mode="production")
-    error = refusal(lambda: start(lab))
-    assert error.code == "ANALYSIS_MODEL_NOT_SUPPORTED"
+    error = refusal(lambda: start(lab, model="other/model"))
+    assert (error.kind, error.code) == (ErrorKind.INVALID, "ANALYSIS_MODEL_NOT_SUPPORTED")
     assert written(lab) == (0, 0, 0)
+
+
+def test_production_accepts_the_probed_model_and_stops_on_the_missing_key(rig: Rig) -> None:
+    lab = rig.build(mode="production")
+    error = refusal(lambda: start(lab, model="anthropic/claude-haiku-5.5"))
+    assert (error.kind, error.code) == (ErrorKind.CONFLICT, "API_KEY_REQUIRED")
+    assert written(lab) == (0, 0, 0)
+    assert lab.chat.bodies == []
 
 
 @pytest.mark.parametrize(
